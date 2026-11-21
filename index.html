@@ -93,6 +93,14 @@
   .ltime { font-size:56px; font-weight:900; font-variant-numeric:tabular-nums; }
   .transcript { width:min(94vw,820px); height:38vh; overflow-y:auto; -webkit-overflow-scrolling:touch; background:#fff; border-radius:22px; padding:16px 20px; text-align:left; font-size:20px; line-height:1.4; margin:12px 0; border:3px solid #EDE6F7; }
   .transcript .interim { color:#A39BBF; }
+  .btn:focus-visible, .kid:focus-visible, .gear:focus-visible { outline:5px solid #7C6CF2; outline-offset:4px; }
+  .btn.pause { background:#FFF3C4; color:#6A4B00; border:3px solid #F5D76E; }
+  .btn.endb { background:#E2574C; color:#fff; box-shadow:0 6px 0 #A8382F; }
+  .kid .today { font-size:18px; font-weight:800; display:block; margin-top:8px; background:rgba(255,255,255,.25); border-radius:999px; padding:4px 12px; }
+  .toast { display:none; font-size:22px; font-weight:700; background:#DDF6EC; color:#137A55; border-radius:20px; padding:14px 22px; margin:0 auto 18px; max-width:760px; }
+  .toast.on { display:block; }
+  .toast.warn { background:#FFE9D6; color:#B35A12; }
+  .doneToday { font-size:30px; font-weight:800; color:#137A55; margin:10px 0 18px; }
   .btn.stopbig { background:#E2574C; box-shadow:0 8px 0 #A8382F; }
   /* ---- review screen ---- */
   .review { width:min(96vw,860px); text-align:left; }
@@ -149,8 +157,9 @@
   <div class="wrap">
   <h1>Who's practicing?</h1>
   <p class="sub">Tap your name and instrument, then tap Start.</p>
+  <div class="toast" id="toast" role="status"></div>
   <div class="kids" id="kids"></div>
-  <p class="note">The clock only runs while your instrument is playing. 🎶</p>
+  <p class="note">The clock only runs while your instrument is playing. 🎶 Today's time is saved, so you can stop and pick up where you left off later. If it hears no sound for 3 minutes, practice is saved and ended.</p>
   </div>
 </section>
 
@@ -160,6 +169,7 @@
   <div class="wrap">
   <div class="who" id="readyWho"></div>
   <div class="clock" id="readyClock"></div>
+  <div class="doneToday" id="doneToday" style="display:none"></div>
   <button class="btn big" id="startBtn">▶ Start</button>
   <p class="err" id="micErr"></p>
   <div class="tnotes notes-ui" id="readyNotes"></div>
@@ -178,7 +188,8 @@
   <div class="meter" title="sound level"><div id="lvl"></div><i id="thr"></i></div>
   <div class="nudge notes-ui" id="nudge"></div>
   <div class="coach notes-ui" id="coach"></div>
-  <div class="row"><button class="btn alt" id="metroToggle">🥁 Metronome</button><button class="btn done" id="doneBtn">I'm done for now</button></div>
+  <div class="small" id="quietWarn" style="min-height:1.4em;font-weight:700;color:#B35A12"></div>
+  <div class="row"><button class="btn pause" id="pauseBtn">⏸ Pause</button><button class="btn endb" id="doneBtn">■ End</button><button class="btn alt" id="metroToggle">🥁 Metronome</button></div>
   <div class="metro" id="metro" style="display:none">
     <div class="mrow">
       <button class="mb" id="mMinus" aria-label="slower">−</button>
@@ -901,6 +912,21 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   function show(id) { document.querySelectorAll('.screen').forEach(function (s) { s.classList.toggle('on', s.id === id); }); }
   function fmt(sec) { sec = Math.max(0, Math.ceil(sec)); var m = Math.floor(sec / 60), s = sec % 60; return m + ':' + (s < 10 ? '0' : '') + s; }
 
+  // ---------- Today's saved practice time (per kid + instrument, resets at local midnight) ----------
+  // Stored as day.YYYY-MM-DD = { "Abram|Piano": seconds, ... }. The page's own clock is local time (Indianapolis on the family iPad).
+  var QS = (function () { var o = {}; (location.search || '').replace(/^\?/, '').split('&').forEach(function (kv) { if (!kv) return; var i = kv.indexOf('='); o[decodeURIComponent(i < 0 ? kv : kv.slice(0, i))] = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' ')); }); return o; })();
+  // End practice after this long with no sound at all. ?quietEnd=SECONDS is a test-only override for this page load.
+  var QUIET_END_MS = (QS.quietEnd && +QS.quietEnd > 0 ? +QS.quietEnd : 180) * 1000;
+  function p2(n) { return (n < 10 ? '0' : '') + n; }
+  function dayOf(d) { d = d || new Date(); return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()); }
+  function kidKey(k) { return k.name + '|' + (k.instrument || ''); }
+  function doneToday(k, day) { var m = store.get('day.' + (day || dayOf()), {}) || {}; return +m[kidKey(k)] || 0; }
+  function saveDone(k, sec, day) {
+    day = day || dayOf(); var m = store.get('day.' + day, {}) || {}; m[kidKey(k)] = Math.max(+m[kidKey(k)] || 0, Math.round(sec * 10) / 10);
+    store.set('day.' + day, m);
+    var days = store.get('days', []) || []; if (days.indexOf(day) < 0) { days.push(day); days.sort(); while (days.length > 14) { var old = days.shift(); try { localStorage.removeItem('wpt.day.' + old); } catch (e) {} } store.set('days', days); }
+  }
+
   // ---------- Detector + microphone ----------
   var det = createDetector({ sensitivity: store.get('sens', 5), quietMs: store.get('quietMs', 2500) });
   var savedFloor = store.get('floor', null); if (savedFloor) det.calibrate(savedFloor);
@@ -1058,14 +1084,20 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     var box = $('kids'); box.innerHTML = '';
     KIDS.forEach(function (k) {
       var b = document.createElement('button'); b.className = 'kid'; b.style.background = k.color;
-      b.innerHTML = '<span class="emoji">' + k.emoji + '</span><span class="name">' + k.name + '</span><span class="what">' + k.instrument + ' · ' + k.minutes + ' min</span>';
+      var dn = doneToday(k), tgt = k.minutes * 60;
+      var today = dn >= tgt ? '✓ Done today' : (dn >= 1 ? fmt(dn) + ' done · ' + fmt(tgt - dn) + ' left' : '');
+      b.innerHTML = '<span class="emoji">' + k.emoji + '</span><span class="name">' + k.name + '</span><span class="what">' + k.instrument + ' · ' + k.minutes + ' min</span>' + (today ? '<span class="today">' + today + '</span>' : '');
       b.onclick = function () { openKid(k); };
       box.appendChild(b);
     });
     renderDraftBar();
   }
   function openKid(k) {
-    kid = k; $('readyWho').textContent = k.emoji + ' ' + k.name + ' · ' + k.instrument; $('readyClock').textContent = fmt(k.minutes * 60); $('micErr').textContent = '';
+    kid = k; toast(''); $('readyWho').textContent = k.emoji + ' ' + k.name + ' · ' + k.instrument; $('micErr').textContent = '';
+    var dn = doneToday(k), tgt = k.minutes * 60;
+    $('readyClock').textContent = fmt(Math.max(0, tgt - dn));
+    if (dn >= tgt) { $('doneToday').textContent = '✓ All ' + k.minutes + ' minutes done today. Great job!'; $('doneToday').style.display = ''; $('startBtn').style.display = 'none'; }
+    else { $('doneToday').style.display = 'none'; $('startBtn').style.display = ''; $('startBtn').textContent = dn >= 1 ? '▶ Pick up where you left off' : '▶ Start'; }
     if (NOTES_ON) {
       renderNotes(k);
       pullLessons(k).then(function (changed) { if (changed && kid === k && $('ready').classList.contains('on')) renderNotes(k); });
@@ -1079,7 +1111,10 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     $('micErr').textContent = '';
     startMic().then(function () {
       det.reset();
-      session = { kid: kid, startedAt: new Date(), played: 0, last: performance.now(), done: false };
+      var day = dayOf(), base = doneToday(kid, day);
+      if (base >= kid.minutes * 60) { stopMic(); openKid(kid); return; }
+      session = { kid: kid, startedAt: new Date(), day: day, base: base, played: 0, last: performance.now(), heardAt: performance.now(), savedAt: 0, paused: false, done: false };
+      setPauseUi(false); $('quietWarn').textContent = '';
       $('pracWho').textContent = kid.emoji + ' ' + kid.name + ' · ' + kid.instrument;
       if (NOTES_ON) setupCoach(session);
       keepAwake(); show('practice'); render(false);
@@ -1091,34 +1126,73 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   function step() {
     var now = performance.now(), dt = Math.min(0.5, (now - session.last) / 1000); session.last = now;
     var r = det.update(readLevel(), now, metro.gated(audio ? audio.analyser.fftSize / audio.ctx.sampleRate : 0.05), readTone(session.kid && session.kid.instrument));
-    if (r.playing) session.played += dt;
+    if (!r.gated && r.level > r.threshold) session.heardAt = now;      // any sound above the room's quiet level
+    var counting = r.playing && !session.paused;
+    if (counting) session.played += dt;
     coachStep(r, now, dt);
     meter($('lvl'), $('thr'), r); if ($('panel').classList.contains('on')) meter($('lvl2'), $('thr2'), r);
-    render(r.playing);
-    if (session.played >= session.kid.minutes * 60) finish(true);
+    render(counting);
+    if (now - session.savedAt > 3000) persist(now);
+    if (session.base + session.played >= session.kid.minutes * 60) { finish('done'); return; }
+    var quiet = now - session.heardAt, left = QUIET_END_MS - quiet;
+    $('quietWarn').textContent = left <= Math.min(30000, QUIET_END_MS / 2) ? 'No sound… practice ends and saves in ' + Math.ceil(Math.max(0, left) / 1000) + ' s' : '';
+    if (quiet >= QUIET_END_MS) finish('quiet');
   }
+  // Save today's total and an unsent-session record every few seconds, so closing or reloading the page keeps the time.
+  function persist(now) {
+    if (!session) return;
+    session.savedAt = now || performance.now();
+    saveDone(session.kid, session.base + session.played, session.day);
+    store.set('live', { kid: session.kid.name, instrument: session.kid.instrument, minutes: session.kid.minutes, startedAt: session.startedAt.getTime(), day: session.day, base: session.base, played: session.played });
+  }
+  // A session that was cut off (page closed, iPad restarted) is logged the next time the page opens.
+  function recoverLive() {
+    var L = store.get('live', null); if (!L) return;
+    store.set('live', null);
+    var k = null; KIDS.forEach(function (x) { if (x.name === L.kid && x.instrument === L.instrument) k = x; });
+    k = k || { name: L.kid, instrument: L.instrument, minutes: L.minutes };
+    saveDone(k, L.base + L.played, L.day);
+    if (L.played >= 1) logSession({ kid: k, startedAt: new Date(L.startedAt), base: L.base, played: L.played, endedBy: 'closed' }, L.base + L.played >= k.minutes * 60, true);
+  }
+  function setPauseUi(p) { var b = $('pauseBtn'); b.textContent = p ? '▶ Resume' : '⏸ Pause'; b.classList.toggle('big', p); }
+  function togglePause() {
+    if (!session) return;
+    session.paused = !session.paused; setPauseUi(session.paused); persist();
+    if (!session.paused && audio && audio.ctx.state === 'suspended' && audio.ctx.resume) audio.ctx.resume();
+    render(false);
+  }
+  function toast(msg, warn) { var t = $('toast'); t.textContent = msg || ''; t.classList.toggle('on', !!msg); t.classList.toggle('warn', !!warn); }
   function render(playing) {
-    var target = session.kid.minutes * 60, left = target - session.played;
+    var target = session.kid.minutes * 60, total = session.base + session.played, left = target - total;
     $('clock').textContent = fmt(left);
     $('clock').style.color = playing ? 'var(--ink)' : '#B9AEF7';
     var st = $('status');
-    if (playing) { st.className = 'status go'; st.textContent = '🎵 Playing — keep it up!'; }
+    if (session.paused) { st.className = 'status wait'; st.textContent = '⏸ Paused — tap Resume to keep going'; }
+    else if (playing) { st.className = 'status go'; st.textContent = '🎵 Playing — keep it up!'; }
     else if (audio && audio.ctx.state === 'suspended') { st.className = 'status wait'; st.textContent = '👆 Tap the screen, then start playing!'; }
-    else { st.className = 'status wait'; st.textContent = session.played < 1 ? '🎶 Start playing!' : '⏸ Paused - keep playing!'; }
-    $('prog').style.width = Math.min(100, session.played / target * 100) + '%';
+    else { st.className = 'status wait'; st.textContent = total < 1 ? '🎶 Start playing!' : '🎶 Waiting for you to play…'; }
+    $('prog').style.width = Math.min(100, total / target * 100) + '%';
   }
   function pauseTick() { clearInterval(tick); tick = null; }
-  function finish(completed) {
+  // why: 'done' (reached today's target), 'end' (End button), 'quiet' (no sound for QUIET_END_MS)
+  function finish(why) {
     if (!session || session.done) return;
-    pauseTick(); session.done = true; stopMic(); releaseAwake();
+    pauseTick(); session.done = true; metro.stop(); stopMic(); releaseAwake();
     endCoach(session);
-    logSession(session, completed);
-    if (completed) celebrate(); else { show('pick'); }
-    session = null;
+    var s = session, total = s.base + s.played, target = s.kid.minutes * 60, completed = total >= target;
+    saveDone(s.kid, total, s.day); store.set('live', null);
+    s.endedBy = why;
+    logSession(s, completed);
+    session = null; $('quietWarn').textContent = '';
+    if (why === 'done') { toast(''); celebrate(); return; }
+    renderKids(); show('pick');
+    var who = s.kid.name + ' · ' + s.kid.instrument + ': ' + fmt(total) + ' of ' + fmt(target) + ' saved for today.';
+    if (why === 'quiet') toast('No sound for ' + Math.round(QUIET_END_MS / 60000 * 10) / 10 + ' minutes, so practice was saved and ended. ' + who + ' Tap your name to pick up where you left off.', true);
+    else toast('Saved! ' + who + ' Tap your name any time today to pick up where you left off.');
   }
-  function earlyStop() {
+  function earlyStop() {   // (unused since the End button saves and goes home)
     pauseTick();
-    var left = session.kid.minutes * 60 - session.played;
+    var left = session.kid.minutes * 60 - session.base - session.played;
     $('earlySub').textContent = 'You played ' + Math.floor(session.played / 60) + ' min ' + Math.floor(session.played % 60) + ' sec. Only ' + fmt(left) + ' to go!';
     show('early');
   }
@@ -1126,15 +1200,16 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
 
   // ---------- Logging to Google Sheet ----------
   function pad(n) { return (n < 10 ? '0' : '') + n; }
-  function logSession(s, completed) {
-    var d = s.startedAt, end = new Date();
+  function logSession(s, completed, recovered) {
+    var d = s.startedAt, end = recovered ? new Date(s.startedAt.getTime() + (s.played || 0) * 1000) : new Date();
     var row = {
       date: d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()),
       start: pad(d.getHours()) + ':' + pad(d.getMinutes()),
       kid: s.kid.name, instrument: s.kid.instrument, target: s.kid.minutes,
       actual: Math.round(s.played / 60 * 10) / 10, completed: completed ? 'Yes' : 'No',
       length: Math.round((end - d) / 60000 * 10) / 10, id: d.getTime() + '-' + s.kid.name + '-' + (s.kid.instrument || ''),
-      coaching: s.coaching || ''
+      coaching: s.coaching || '',
+      dayTotal: Math.round(((s.base || 0) + s.played) / 60 * 10) / 10, endedBy: s.endedBy || ''
     };
     var q = store.get('queue', []); q.push(row); store.set('queue', q); flush();
   }
@@ -1146,6 +1221,16 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     fetch(url, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ rows: q }) })
       .then(function () { var cur = store.get('queue', []); store.set('queue', cur.slice(q.length)); updateQueueMsg(); })
       .catch(function () { /* stays queued; retried later */ });
+  }
+  // Another device (or a cleared iPad) may have practiced today: take the larger of this iPad's total and the Sheet's.
+  function pullToday() {
+    var url = logUrl(); if (!url || !window.fetch || !navigator.onLine) return;
+    var day = dayOf();
+    fetch(url + (url.indexOf('?') < 0 ? '?' : '&') + 'today=' + day).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j || !j.totals) return; var changed = false;
+      KIDS.forEach(function (k) { var t = +j.totals[kidKey(k)]; if (t > 0 && t * 60 > doneToday(k, day) + 1) { saveDone(k, t * 60, day); changed = true; } });
+      if (changed && !session && $('pick').classList.contains('on')) renderKids();
+    }).catch(function () {});
   }
   function updateQueueMsg() { var n = store.get('queue', []).length; $('queueMsg').textContent = n ? n + ' session(s) waiting to be sent to the Sheet.' : (logUrl() ? 'All sessions sent.' : 'No Sheet address set yet; sessions are kept on this iPad until one is added.'); }
   window.addEventListener('online', function () { flush(); flushLessons(); }); setInterval(function () { flush(); flushLessons(); }, 5 * 60 * 1000);
@@ -1224,9 +1309,14 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   if ($('resetBase')) $('resetBase').onclick = function () { KIDS.forEach(function (k) { store.set('loudBase.' + k.name, null); }); this.textContent = 'Done ✓ (it re-learns over the next sessions)'; };
 
   // ---------- Wire up ----------
-  $('backBtn').onclick = function () { show('pick'); };
+  $('backBtn').onclick = function () { renderKids(); show('pick'); };
   $('startBtn').onclick = begin;
-  $('doneBtn').onclick = function () { metro.stop(); earlyStop(); };
+  $('doneBtn').onclick = function () { finish('end'); };
+  $('pauseBtn').onclick = togglePause;
+  window.addEventListener('pagehide', function () { if (session) persist(); });
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden' && session) persist(); });
+  // Midnight rollover: refresh the cards so "done today" resets.
+  var shownDay = dayOf(); setInterval(function () { if (dayOf() !== shownDay) { shownDay = dayOf(); if (!session && $('pick').classList.contains('on')) { toast(''); renderKids(); } } }, 60000);
   $('metroToggle').onclick = function () { var m = $('metro'); m.style.display = m.style.display === 'none' ? 'block' : 'none'; metro.ui(); };
   $('mGo').onclick = metro.toggle;
   $('mTap').onclick = metro.tap;
@@ -1241,8 +1331,8 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   holdRepeat($('mMinus'), -1); holdRepeat($('mPlus'), 1);
   metro.ui();
   $('keepBtn').onclick = keepGoing;
-  $('earlyDoneBtn').onclick = function () { session.done = false; finish(false); };
-  $('finishBtn').onclick = endCelebration;
+  $('earlyDoneBtn').onclick = function () { session.done = false; finish('end'); };
+  $('finishBtn').onclick = function () { endCelebration(); renderKids(); };
   $('soundBtn').onclick = function () { var v = $('vid'); v.muted = false; v.currentTime = 0; v.play(); this.style.display = 'none'; };
   // ======================= Lessons: storage + sync with the Sheet =======================
   function esc(t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
@@ -1638,10 +1728,12 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if ($('nudge')) $('nudge').classList.remove('on');
   }
   if (NOTES_ON && IOSV !== null && IOSV < 14.05 && !SR && $('lessonHint')) $('lessonHint').textContent = 'Grown-ups: tap 🎓 Lesson when the teacher starts, then type the teacher’s notes (live notes need a newer iPad).';
-  renderKids(); flush(); flushLessons();
+  recoverLive(); renderKids(); flush(); flushLessons(); pullToday();
+  // Deep link: ?kid=Abram&instrument=Piano opens that kid's Start screen.
+  if (QS.kid) KIDS.forEach(function (k) { if (k.name.toLowerCase() === String(QS.kid).toLowerCase() && (!QS.instrument || k.instrument.toLowerCase() === String(QS.instrument).toLowerCase()) && !kid) openKid(k); });
   window.__wpt = { metro: metro, det: det, KIDS: KIDS, NOTES_ON: NOTES_ON, LOUD_COACH_ON: LOUD_COACH_ON,
     analyzeTone: typeof analyzeTone === 'function' ? analyzeTone : null,
-    logSession: logSession, getSession: function () { return session; },
+    logSession: logSession, getSession: function () { return session; }, doneToday: doneToday, dayOf: dayOf, QUIET_END_MS: QUIET_END_MS, finish: finish,
     lessonsOf: lessonsOf, openKid: openKid, getLesson: function () { return lesson; }, checkServer: checkServer, store: store, getAudio: function () { return audio; } }; // for testing
 })();
 </script>

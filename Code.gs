@@ -1,4 +1,4 @@
-// Wagner Practice Log (v2) - receives practice sessions and lesson notes from the practice timer page.
+// Wagner Practice Log (v3) - receives practice sessions and lesson notes from the practice timer page.
 // Paste into Extensions > Apps Script, then Deploy > Manage deployments > Edit (pencil) > Version: New version > Deploy
 // (that keeps the same /exec address).
 //
@@ -6,8 +6,10 @@
 //  POST {type:'lesson', id, ...}        -> "Lessons" tab: Date, Kid, Instrument, Notes JSON, Transcript, Lesson ID
 //                                          (same id again = update that row; deleted:true = remove it)
 //  GET  ?kid=Abram                      -> that kid's recent lesson notes as JSON (no transcripts)
-//  GET  (no parameters)                 -> {ok:true, app, version:2}
-var LOG_HEADERS = ['Date', 'Start time', 'Kid', 'Instrument', 'Target minutes', 'Actual playing minutes', 'Completed', 'Session length (min)', 'Session ID', 'Coaching'];
+//  GET  ?today=YYYY-MM-DD               -> {totals:{'Abram|Piano': minutes, ...}} practiced that day (so the page can resume)
+//  GET  (no parameters)                 -> {ok:true, app, version:3}
+//  v3: Log rows also get 'Day total (min)' and 'Ended by' (done / end / quiet / closed).
+var LOG_HEADERS = ['Date', 'Start time', 'Kid', 'Instrument', 'Target minutes', 'Actual playing minutes', 'Completed', 'Session length (min)', 'Session ID', 'Coaching', 'Day total (min)', 'Ended by'];
 var LESSON_HEADERS = ['Date', 'Kid', 'Instrument', 'Notes JSON', 'Transcript', 'Lesson ID'];
 var MAX_CELL = 49000;
 
@@ -21,17 +23,17 @@ function doPost(e) {
       var rows = data.rows || [data];
       var sheet = SpreadsheetApp.getActive().getSheetByName('Log');
       if (!sheet) { sheet = SpreadsheetApp.getActive().insertSheet('Log'); sheet.appendRow(LOG_HEADERS); }
-      if (sheet.getLastColumn() < 10 && sheet.getLastRow() >= 1 && sheet.getRange(1, 1).getValue() === 'Date') sheet.getRange(1, 10).setValue('Coaching');
+      if (sheet.getLastColumn() < 12 && sheet.getLastRow() >= 1 && sheet.getRange(1, 1).getValue() === 'Date') sheet.getRange(1, 10, 1, 3).setValues([['Coaching', 'Day total (min)', 'Ended by']]);
       var last = sheet.getLastRow();
       var seen = last > 1 ? sheet.getRange(2, 9, last - 1, 1).getValues().map(function (r) { return String(r[0]); }) : [];
       rows.forEach(function (r) {
         if (r.id && seen.indexOf(String(r.id)) !== -1) return; // already logged (retry)
-        sheet.appendRow([r.date, r.start, r.kid, r.instrument, r.target, r.actual, r.completed, r.length, r.id || '', safe_(r.coaching || '')]);
+        sheet.appendRow([r.date, r.start, r.kid, r.instrument, r.target, r.actual, r.completed, r.length, r.id || '', safe_(r.coaching || ''), r.dayTotal == null ? '' : r.dayTotal, safe_(r.endedBy || '')]);
         if (r.id) seen.push(String(r.id));
       });
     }
   } finally { lock.releaseLock(); }
-  return json_({ ok: true, version: 2 });
+  return json_({ ok: true, version: 3 });
 }
 
 function lessonsSheet_() {
@@ -62,7 +64,8 @@ function saveLesson_(L) {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.kid) return json_({ ok: true, app: 'Wagner Practice Log', version: 2 });
+  if (p.today) return json_(todayTotals_(String(p.today)));
+  if (!p.kid) return json_({ ok: true, app: 'Wagner Practice Log', version: 3 });
   var kid = String(p.kid).toLowerCase(), limit = Math.min(30, Math.max(1, parseInt(p.limit, 10) || 10));
   var sh = SpreadsheetApp.getActive().getSheetByName('Lessons'), out = [];
   if (sh && sh.getLastRow() > 1) {
@@ -74,7 +77,25 @@ function doGet(e) {
     });
   }
   out.sort(function (a, b) { return (parseInt(b.id, 10) || 0) - (parseInt(a.id, 10) || 0); });
-  return json_({ ok: true, version: 2, kid: p.kid, limit: limit, lessons: out.slice(0, limit) });
+  return json_({ ok: true, version: 3, kid: p.kid, limit: limit, lessons: out.slice(0, limit) });
+}
+
+// Minutes practiced on one day per "Kid|Instrument": the largest Day total logged, or the sum of the
+// session minutes when older rows have no Day total.
+function todayTotals_(day) {
+  var sh = SpreadsheetApp.getActive().getSheetByName('Log'), sums = {}, best = {}, totals = {};
+  if (sh && sh.getLastRow() > 1) {
+    var cols = Math.max(11, Math.min(12, sh.getLastColumn()));
+    var vals = sh.getRange(2, 1, sh.getLastRow() - 1, cols).getValues();
+    vals.forEach(function (v) {
+      if (dateStr_(v[0]) !== day || String(v[2]) === 'TEST') return;
+      var k = String(v[2]) + '|' + String(v[3]);
+      sums[k] = (sums[k] || 0) + (parseFloat(v[5]) || 0);
+      var dt = parseFloat(v[10]); if (dt > 0) best[k] = Math.max(best[k] || 0, dt);
+    });
+  }
+  Object.keys(sums).concat(Object.keys(best)).forEach(function (k) { totals[k] = Math.max(best[k] || 0, sums[k] || 0); });
+  return { ok: true, version: 3, day: day, totals: totals };
 }
 
 function dateStr_(v) {
