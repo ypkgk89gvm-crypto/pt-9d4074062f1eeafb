@@ -64,6 +64,10 @@
   .metro .mgo { font-size:30px; font-weight:800; padding:22px 44px; border-radius:999px; border:0; background:var(--go); color:#fff; min-width:220px; touch-action:manipulation; }
   .metro .mgo.on { background:var(--stop); }
   .metro .tap { font-size:24px; font-weight:700; padding:20px 30px; border-radius:999px; border:3px solid #EDE6F7; background:#fff; color:var(--ink); touch-action:manipulation; }
+  .metro { position:relative; }
+  .metro .mclose { position:absolute; top:10px; right:10px; font:inherit; font-size:20px; font-weight:800; padding:10px 16px; border-radius:999px; border:3px solid #EDE6F7; background:#fff; color:var(--ink); touch-action:manipulation; cursor:pointer; }
+  .metro .mclose:focus-visible, .metro button:focus-visible { outline:5px solid #7C6CF2; outline-offset:3px; }
+  .btn.mon { background:#DDF6EC; border-color:#8FD9B6; color:#137A55; }
   .metro input[type=range] { width:100%; height:44px; }
   .metro .beats button { font-size:22px; font-weight:700; padding:14px 20px; border-radius:16px; border:3px solid #EDE6F7; background:#fff; color:var(--ink); touch-action:manipulation; }
   .metro .beats button.sel { background:var(--ink); color:#fff; border-color:var(--ink); }
@@ -191,7 +195,8 @@
   <div class="small" id="quietWarn" style="min-height:1.4em;font-weight:700;color:#B35A12"></div>
   <div class="row"><button class="btn pause" id="pauseBtn">⏸ Pause</button><button class="btn endb" id="doneBtn">■ End</button><button class="btn alt" id="metroToggle">🥁 Metronome</button></div>
   <div class="metro" id="metro" style="display:none">
-    <div class="mrow">
+    <button class="mclose" id="mClose" aria-label="Hide metronome">✕ Hide</button>
+    <div class="mrow" style="margin-top:44px">
       <button class="mb" id="mMinus" aria-label="slower">−</button>
       <div class="bpm"><span id="mBpm">80</span><small>beats per minute</small></div>
       <button class="mb" id="mPlus" aria-label="faster">+</button>
@@ -1031,6 +1036,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
       if (!$('mBpm')) return;
       $('mBpm').textContent = bpm; $('mSlider').value = bpm;
       $('mGo').textContent = running ? '■ Stop' : '▶ Start'; $('mGo').classList.toggle('on', running);
+      if (typeof metroBtnUi === 'function' && $('metroToggle')) metroBtnUi();
       Array.prototype.forEach.call(document.querySelectorAll('#mBeats button'), function (b) { b.classList.toggle('sel', +b.dataset.b === beats); });
     }
     var taps = [];
@@ -1114,7 +1120,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
       var day = dayOf(), base = doneToday(kid, day);
       if (base >= kid.minutes * 60) { stopMic(); openKid(kid); return; }
       session = { kid: kid, startedAt: new Date(), day: day, base: base, played: 0, last: performance.now(), heardAt: performance.now(), savedAt: 0, paused: false, done: false };
-      setPauseUi(false); $('quietWarn').textContent = '';
+      setPauseUi(false); $('quietWarn').textContent = ''; showMetro(false);
       $('pracWho').textContent = kid.emoji + ' ' + kid.name + ' · ' + kid.instrument;
       if (NOTES_ON) setupCoach(session);
       keepAwake(); show('practice'); render(false);
@@ -1317,7 +1323,19 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden' && session) persist(); });
   // Midnight rollover: refresh the cards so "done today" resets.
   var shownDay = dayOf(); setInterval(function () { if (dayOf() !== shownDay) { shownDay = dayOf(); if (!session && $('pick').classList.contains('on')) { toast(''); renderKids(); } } }, 60000);
-  $('metroToggle').onclick = function () { var m = $('metro'); m.style.display = m.style.display === 'none' ? 'block' : 'none'; metro.ui(); };
+  // Metronome panel: the 🥁 button opens and closes it; ✕ Hide also closes it. Hiding keeps the beat going, and the button then says so.
+  function metroOpen() { return $('metro').style.display !== 'none'; }
+  function metroBtnUi() {
+    var b = $('metroToggle'), on = metro.isRunning();
+    b.textContent = metroOpen() ? '🥁 Hide metronome' : (on ? '🥁 Metronome on · ' + metro.getBpm() : '🥁 Metronome');
+    b.classList.toggle('mon', on && !metroOpen()); b.setAttribute('aria-expanded', metroOpen() ? 'true' : 'false');
+  }
+  function showMetro(open) {
+    $('metro').style.display = open ? 'block' : 'none'; metro.ui(); metroBtnUi();
+    if (open) { try { $('metro').scrollIntoView({ block: 'nearest' }); } catch (e) { $('metro').scrollIntoView(false); } }
+  }
+  $('metroToggle').onclick = function () { showMetro(!metroOpen()); };
+  $('mClose').onclick = function () { showMetro(false); try { $('metroToggle').focus(); } catch (e) {} };
   $('mGo').onclick = metro.toggle;
   $('mTap').onclick = metro.tap;
   $('mSlider').oninput = function () { metro.setBpm(+this.value); };
