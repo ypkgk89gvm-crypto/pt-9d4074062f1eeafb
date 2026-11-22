@@ -42,7 +42,13 @@
   .gear { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; position:fixed; top:14px; right:16px; z-index:20; border:0; background:none; font-size:26px; opacity:.35; padding:10px; cursor:pointer; }
   .back { position:fixed; top:14px; left:16px; z-index:20; }
   #celebrate { background:#2B2340; color:#fff; }
-  #celebrate .sub { color:#E3DDFB; }
+  #celebrate .sub { color:#E3DDFB; margin:4px 0 8px; }
+  #celebrate { justify-content:center; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:16px; }
+  #celebrate h1 { margin:10px 0 0; font-size:max(30px,min(5vw,48px)); font-size:clamp(30px,5vw,48px); }
+  #celebrate .row { margin-top:12px; }
+  #celebrate .dadcard { background:#FFF8EC; border-radius:32px; padding:6px; box-shadow:0 10px 30px rgba(0,0,0,.35); -webkit-flex-shrink:0; flex-shrink:0; line-height:0; }
+  #celebrate .dadcard img { display:block; width:min(460px,80vw,52vh); height:auto; border-radius:28px; }
+  @media (orientation: landscape) and (max-height: 820px) { #celebrate .dadcard img { width:min(460px,80vw,50vh); } }
   #celebrate video { max-width:min(90vw,900px); max-height:55vh; border-radius:24px; display:none; background:#000; margin:12px 0; }
   #confetti { position:fixed; top:0; right:0; bottom:0; left:0; inset:0; pointer-events:none; z-index:5; }
   #celebrate > *:not(canvas) { position:relative; z-index:6; }
@@ -270,11 +276,12 @@
 <!-- 4. Celebration -->
 <section class="screen" id="celebrate">
   <canvas id="confetti"></canvas>
-  <h1 id="celebTitle">You did it! 🎉</h1>
+  <div class="dadcard"><img id="dadGif" src="dad-celebrate.gif" alt="Dad cheering"></div>
+  <h1 id="celebTitle">Great job! You finished!</h1>
   <p class="sub" id="celebSub"></p>
   <video id="vid" playsinline preload="auto"></video>
   <div class="row"><button class="btn alt" id="soundBtn" style="display:none">🔊 Tap for sound</button>
-  <button class="btn big" id="finishBtn">All done</button></div>
+  <button class="btn big" id="finishBtn">🏠 Back home</button></div>
 </section>
 
 <!-- 5. Stopped early -->
@@ -946,9 +953,9 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   // Lesson notes are off, so per-name note storage is not used.
   var KIDS = [
     { name: 'Abram', instrument: 'Piano',  minutes: 40, emoji: '🎹', color: '#7C6CF2' },
-    { name: 'Abram', instrument: 'Trumpet', minutes: 20, emoji: '🎺', color: '#C46E1A' },
+    { name: 'Abram', instrument: 'Trumpet', minutes: 25, emoji: '🎺', color: '#C46E1A' },
     { name: 'Eden',  instrument: 'Piano',  minutes: 20, emoji: '🎹', color: '#F06292' },
-    { name: 'Ellis', instrument: 'Violin', minutes: 25, emoji: '🎻', color: '#26A69A' }
+    { name: 'Ellis', instrument: 'Violin', minutes: 20, emoji: '🎻', color: '#26A69A' }
   ];
   var NOTES_ON = false;      // hide lesson notes, listening, and review; minute logging stays
   var LOUD_COACH_ON = false; // no louder/softer prompts, summaries, or "usual loudness"
@@ -1301,10 +1308,12 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   var confettiOn = false;
   function celebrate() {
     var k = kid;
-    $('celebTitle').textContent = 'You did it, ' + k.name + '! 🎉';
-    $('celebSub').textContent = k.minutes + ' minutes of ' + k.instrument.toLowerCase() + ' practice. Amazing!';
-    show('celebrate'); startConfetti();
+    $('celebTitle').textContent = 'Great job, ' + k.name + '! You finished! 🎉';
+    $('celebSub').textContent = Math.round(k.minutes) + ' minutes of ' + k.instrument.toLowerCase() + ' practice today. Amazing!';
+    var gi = $('dadGif'); gi.src = 'dad-celebrate.gif';   // restart the animation from the top
+    show('celebrate'); startConfetti(); try { $('finishBtn').focus(); } catch (e) {}
     var v = $('vid'); v.style.display = 'none'; $('soundBtn').style.display = 'none';
+    if (!store.get('vidUrl', '')) return;   // no custom video set: the dad GIF + confetti is the celebration
     v.onerror = function () { v.style.display = 'none'; $('soundBtn').style.display = 'none'; };  // no video yet: confetti only
     v.oncanplay = function () { v.style.display = 'block'; };
     v.src = vidUrl(); v.muted = false;
@@ -1815,6 +1824,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if ($('nudge')) $('nudge').classList.remove('on');
   }
   if (NOTES_ON && IOSV !== null && IOSV < 14.05 && !SR && $('lessonHint')) $('lessonHint').textContent = 'Grown-ups: tap 🎓 Lesson when the teacher starts, then type the teacher’s notes (live notes need a newer iPad).';
+  (new Image()).src = 'dad-celebrate.gif';
   recoverLive(); renderKids(); flush(); flushLessons(); pullToday();
   // Deep link: ?kid=Abram&instrument=Piano opens that kid's Start screen.
   if (QS.kid) KIDS.forEach(function (k) { if (k.name.toLowerCase() === String(QS.kid).toLowerCase() && (!QS.instrument || k.instrument.toLowerCase() === String(QS.instrument).toLowerCase()) && !kid) openKid(k); });
