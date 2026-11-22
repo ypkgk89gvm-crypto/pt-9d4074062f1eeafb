@@ -227,18 +227,18 @@ if (!jsdom) {
     return kids.some(function (k) { return k.name === name && k.instrument === instrument && k.minutes === minutes; });
   }
   check('Abram piano 40', has('Abram', 'Piano', 40));
-  check('Abram trumpet 20', has('Abram', 'Trumpet', 20));
+  check('Abram trumpet 25', has('Abram', 'Trumpet', 25));
   check('Eden piano 20', has('Eden', 'Piano', 20));
-  check('Ellis violin 25', has('Ellis', 'Violin', 25));
+  check('Ellis violin 20', has('Ellis', 'Violin', 20));
 
   var buttons = document.querySelectorAll('#kids .kid');
   check('picker renders four buttons', buttons.length === 4);
   var labels = [];
   for (var bi = 0; bi < buttons.length; bi++) labels.push(buttons[bi].textContent.replace(/\s+/g, ' ').trim());
-  check('picker shows trumpet 20', labels.some(function (t) { return t.indexOf('Abram') >= 0 && t.indexOf('Trumpet') >= 0 && t.indexOf('20') >= 0; }), labels);
+  check('picker shows trumpet 25', labels.some(function (t) { return t.indexOf('Abram') >= 0 && t.indexOf('Trumpet') >= 0 && t.indexOf('25') >= 0; }), labels);
   check('picker shows piano 40', labels.some(function (t) { return t.indexOf('Abram') >= 0 && t.indexOf('Piano') >= 0 && t.indexOf('40') >= 0; }), labels);
   check('picker shows Eden', labels.some(function (t) { return t.indexOf('Eden') >= 0 && t.indexOf('Piano') >= 0 && t.indexOf('20') >= 0; }));
-  check('picker shows Ellis', labels.some(function (t) { return t.indexOf('Ellis') >= 0 && t.indexOf('Violin') >= 0 && t.indexOf('25') >= 0; }));
+  check('picker shows Ellis', labels.some(function (t) { return t.indexOf('Ellis') >= 0 && t.indexOf('Violin') >= 0 && t.indexOf('20') >= 0; }));
 
   check('no reset usual-loudness control', !document.getElementById('resetBase'));
   check('lesson button is in the hidden notes UI', document.getElementById('lessonBtn').className.indexOf('notes-ui') === -1 && document.getElementById('lessonBtn').parentNode.className.indexOf('notes-ui') >= 0);
@@ -247,7 +247,7 @@ if (!jsdom) {
   var trumpetKid = kids.filter(function (k) { return k.instrument === 'Trumpet'; })[0];
   wpt.openKid(trumpetKid);
   check('ready screen names Abram trumpet', document.getElementById('readyWho').textContent.indexOf('Abram') >= 0 && document.getElementById('readyWho').textContent.indexOf('Trumpet') >= 0);
-  check('trumpet target is 20:00', document.getElementById('readyClock').textContent === '20:00');
+  check('trumpet target is 25:00', document.getElementById('readyClock').textContent === '25:00');
   check('ready screen has no teacher notes', document.getElementById('readyNotes').innerHTML === '');
   check('ready screen is showing', document.getElementById('ready').className.indexOf('on') >= 0);
   document.getElementById('lessonBtn').click();
@@ -261,10 +261,10 @@ if (!jsdom) {
   function log(k, played, done) {
     wpt.logSession({ kid: k, startedAt: new Date(2026, 0, 15, 16, 5, 0), played: played }, done);
   }
-  log(trumpetKid, 20 * 60, true);
+  log(trumpetKid, 25 * 60, true);
   log(kids[0], 40 * 60, true);
   log(kids[2], 90, false);
-  log(kids[3], 25 * 60, true);
+  log(kids[3], 20 * 60, true);
   Promise.resolve().then(function () {
     check('logged four sessions', posts.length >= 1);
     var rows = [];
@@ -275,10 +275,10 @@ if (!jsdom) {
     });
     function row(instrument) { return rows.filter(function (r) { return r.instrument === instrument; })[0]; }
     var tr = row('Trumpet'), ap = row('Piano'), ed = rows.filter(function (r) { return r.kid === 'Eden'; })[0], el = row('Violin');
-    check('trumpet row is Abram 20', tr && tr.kid === 'Abram' && tr.target === 20 && tr.actual === 20 && tr.completed === 'Yes', tr);
+    check('trumpet row is Abram 25', tr && tr.kid === 'Abram' && tr.target === 25 && tr.actual === 25 && tr.completed === 'Yes', tr);
     check('piano row is Abram 40', ap && ap.kid === 'Abram' && ap.instrument === 'Piano' && ap.target === 40 && ap.actual === 40, ap);
     check('Eden row unchanged', ed && ed.instrument === 'Piano' && ed.target === 20 && ed.actual === 1.5 && ed.completed === 'No', ed);
-    check('Ellis row unchanged', el && el.kid === 'Ellis' && el.target === 25 && el.actual === 25, el);
+    check('Ellis row unchanged', el && el.kid === 'Ellis' && el.target === 20 && el.actual === 20, el);
     check('coaching summary does not say louder or softer', rows.every(function (r) { return !r.coaching || (String(r.coaching).indexOf('Louder') < 0 && String(r.coaching).indexOf('Softer') < 0); }));
     rows.forEach(function (r) {
       check('row has no audio payload', !r.audio && !r.spectrum && !r.samples && JSON.stringify(r).length < 500, r);
