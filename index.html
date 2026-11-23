@@ -202,6 +202,7 @@
   body.metro-open #practice .clock { font-size:max(84px,min(17vw,24vh,220px)); font-size:clamp(84px,min(17vw,24vh),220px); }
   body.metro-open #practice .row { margin-top:16px; }
   .gear { z-index:25; width:56px; height:56px; padding:0; line-height:56px; text-align:center; font-size:28px; opacity:.75; background:rgba(255,255,255,.9); border-radius:50%; box-shadow:0 2px 8px rgba(42,34,72,.15); -webkit-transform:translateZ(0); transform:translateZ(0); touch-action:manipulation; }
+  .btn.micfix { background:#FFF3C4; color:#6A4B00; border:3px solid #F5D76E; font-size:24px; padding:14px 26px; margin:4px 0 6px; animation:pulse 1.4s infinite; }
 </style>
 <script>
 // Feature test: flexbox gap (Safari 14.1+). If missing, <html class="no-flexgap"> turns on the margin fallback above.
@@ -253,6 +254,7 @@
   <div class="meter" title="sound level"><div id="lvl"></div><i id="thr"></i></div>
   <div class="nudge notes-ui" id="nudge"></div>
   <div class="coach notes-ui" id="coach"></div>
+  <button class="btn micfix" id="micFix" style="display:none">🎤 Tap to turn the mic back on</button>
   <div class="small" id="quietWarn" style="min-height:1.4em;font-weight:700;color:#B35A12"></div>
   <div class="row"><button class="btn pause" id="pauseBtn">⏸ Pause</button><button class="btn endb" id="doneBtn">■ End</button><button class="btn alt" id="metroToggle">🥁 Metronome</button></div>
   <div class="metro" id="metro" style="display:none" role="region" aria-label="Metronome">
@@ -1035,7 +1037,14 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   function stopMic() {
     metro.stop();
     onAudioBlock = null;
-    if (!audio) return; if (audio.sp) { audio.sp.onaudioprocess = null; try { audio.sp.disconnect(); } catch (e) {} } audio.stream.getTracks().forEach(function (t) { t.stop(); }); try { audio.ctx.close(); } catch (e) {} audio = null;
+    teardownAudio();
+  }
+  // Close the mic stream and sound engine (but leave the metronome's on/off choice alone).
+  function teardownAudio() {
+    if (!audio) return; var a = audio; audio = null;
+    if (a.sp) { a.sp.onaudioprocess = null; try { a.sp.disconnect(); } catch (e) {} }
+    try { a.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { a.ctx.close(); } catch (e) {}
   }
   // ---------- Metronome (Web Audio, lookahead-scheduled, shares the mic's AudioContext) ----------
   var metro = (function () {
@@ -1176,6 +1185,66 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     }
     show('ready'); $('ready').scrollTop = 0;
   }
+  // ---------- Mic health: notice a dead / suspended / stuck mic and bring it back without reloading ----------
+  // Safari can suspend the sound engine, end or mute the mic track (screen lock, a call, Siri, another tab), or keep
+  // handing back an all-zero signal. Silence auto-end only counts time while the mic is healthy.
+  var MIC_STUCK_MS = 4000;      // the exact same level for this long = no live signal (a real mic always has a little noise)
+  var MIC_GIVEUP_MS = QUIET_END_MS + 60000;   // mic still broken after this long: save and end
+  var mic = { last: -1, sameSince: 0, mutedSince: 0, deadSince: 0, lastTry: 0, tries: 0, busy: false, needTap: false, recoveries: 0, why: '' };
+  function micReset() { mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.deadSince = 0; mic.lastTry = 0; mic.tries = 0; mic.needTap = false; mic.why = ''; micFixUi(); }
+  function micProblem(now, level) {
+    if (document.visibilityState === 'hidden') return 'hidden';
+    if (!audio) return 'none';
+    var st = audio.ctx.state;
+    if (st === 'closed') return 'closed';
+    if (st === 'suspended' || st === 'interrupted') return 'suspended';
+    var ts = audio.stream.getAudioTracks ? audio.stream.getAudioTracks() : audio.stream.getTracks(), tr = ts && ts[0];
+    if (!tr || tr.readyState === 'ended') return 'ended';
+    if (tr.muted) { if (!mic.mutedSince) mic.mutedSince = now; if (now - mic.mutedSince > 3000) return 'muted'; } else mic.mutedSince = 0;
+    if (level === mic.last) { if (!mic.sameSince) mic.sameSince = now; } else mic.sameSince = 0;
+    mic.last = level;
+    if (mic.sameSince && now - mic.sameSince > MIC_STUCK_MS) return level === 0 ? 'zero' : 'flat';
+    return '';
+  }
+  function micFixUi() { var b = $('micFix'); if (b) b.style.display = (session && mic.needTap) ? '' : 'none'; }
+  // Re-create the mic stream + sound engine. Safe to call from a tap (Safari may insist on one).
+  function rebuildMic() {
+    if (mic.busy) return; mic.busy = true;
+    var wasMetro = metro.isRunning(); if (wasMetro) metro.stop();
+    teardownAudio();
+    startMic().then(function () {
+      mic.busy = false; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.recoveries++;
+      if (wasMetro && session) metro.start();
+      if (audio && audio.ctx.state !== 'running') { mic.needTap = true; micFixUi(); }
+    }).catch(function () { mic.busy = false; mic.needTap = true; micFixUi(); });
+  }
+  function healMic(why, now) {
+    if (why === 'hidden' || mic.busy) return;
+    var wait = mic.tries < 3 ? 2500 : 10000;
+    if (now - mic.lastTry < wait) return;
+    mic.lastTry = now; mic.tries++;
+    if (why === 'suspended' && mic.tries <= 2 && audio && audio.ctx.resume) {
+      try { var pr = audio.ctx.resume(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+    } else rebuildMic();
+    if (mic.tries >= 3) { mic.needTap = true; micFixUi(); }   // older Safari may only allow the mic back after a tap
+  }
+  function micFixTap() {
+    if (!session) return;
+    mic.lastTry = performance.now();
+    if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && audio.ctx.resume) {
+      try { var pr = audio.ctx.resume(); if (pr && pr.then) pr.then(function () { if (audio.ctx.state !== 'running') rebuildMic(); }, function () { rebuildMic(); }); } catch (e) { rebuildMic(); }
+    } else rebuildMic();
+  }
+  // Coming back to the page (screen woke, tab switched back, window focused): wake the sound engine and re-check now.
+  function micWake() {
+    if (!session) return;
+    keepAwake();
+    if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && audio.ctx.resume) { try { var pr = audio.ctx.resume(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {} }
+    mic.lastTry = 0; mic.sameSince = 0;
+  }
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') micWake(); });
+  window.addEventListener('pageshow', micWake); window.addEventListener('focus', micWake);
+
   function begin() {
     $('micErr').textContent = '';
     startMic().then(function () {
@@ -1183,7 +1252,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
       var day = dayOf(), base = doneToday(kid, day);
       if (base >= kid.minutes * 60) { stopMic(); openKid(kid); return; }
       session = { kid: kid, startedAt: new Date(), day: day, base: base, played: 0, last: performance.now(), heardAt: performance.now(), savedAt: 0, paused: false, done: false };
-      setPauseUi(false); $('quietWarn').textContent = ''; showMetro(false);
+      setPauseUi(false); $('quietWarn').textContent = ''; showMetro(false); micReset();
       $('pracWho').textContent = kid.emoji + ' ' + kid.name + ' · ' + kid.instrument;
       if (NOTES_ON) setupCoach(session);
       keepAwake(); show('practice'); render(false);
@@ -1194,7 +1263,20 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   }
   function step() {
     var now = performance.now(), dt = Math.min(0.5, (now - session.last) / 1000); session.last = now;
-    var r = det.update(readLevel(), now, metro.gated(audio ? audio.analyser.fftSize / audio.ctx.sampleRate : 0.05), readTone(session.kid && session.kid.instrument));
+    var level = readLevel(), why = micProblem(now, level);
+    mic.why = why;
+    if (why) {
+      // Not real silence: hold the 3-minute quiet clock and fix the mic.
+      session.heardAt = now; if (!mic.deadSince) mic.deadSince = now;
+      healMic(why, now);
+      if (why !== 'hidden' && now - mic.deadSince > MIC_GIVEUP_MS) { finish('mic'); return; }
+      det.reset();
+      render(false); $('quietWarn').textContent = '';
+      if (now - session.savedAt > 3000) persist(now);
+      return;
+    }
+    if (mic.deadSince) { mic.deadSince = 0; mic.tries = 0; mic.needTap = false; micFixUi(); }
+    var r = det.update(level, now, metro.gated(audio ? audio.analyser.fftSize / audio.ctx.sampleRate : 0.05), readTone(session.kid && session.kid.instrument));
     if (!r.gated && r.level > r.threshold) session.heardAt = now;      // any sound above the room's quiet level
     var counting = r.playing && !session.paused;
     if (counting) session.played += dt;
@@ -1237,6 +1319,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     $('clock').style.color = playing ? 'var(--ink)' : '#B9AEF7';
     var st = $('status');
     if (session.paused) { st.className = 'status wait'; st.textContent = '⏸ Paused — tap Resume to keep going'; }
+    else if (mic.why && mic.why !== 'hidden') { st.className = 'status wait'; st.textContent = mic.needTap ? '🎤 The mic stopped — tap the yellow button' : '🎤 Reconnecting the mic…'; }
     else if (playing) { st.className = 'status go'; st.textContent = '🎵 Playing — keep it up!'; }
     else if (audio && audio.ctx.state === 'suspended') { st.className = 'status wait'; st.textContent = '👆 Tap the screen, then start playing!'; }
     else { st.className = 'status wait'; st.textContent = total < 1 ? '🎶 Start playing!' : '🎶 Waiting for you to play…'; }
@@ -1256,7 +1339,9 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if (why === 'done') { toast(''); celebrate(); return; }
     renderKids(); show('pick');
     var who = s.kid.name + ' · ' + s.kid.instrument + ': ' + fmt(total) + ' of ' + fmt(target) + ' saved for today.';
-    if (why === 'quiet') toast('No sound for ' + Math.round(QUIET_END_MS / 60000 * 10) / 10 + ' minutes, so practice was saved and ended. ' + who + ' Tap your name to pick up where you left off.', true);
+    mic.needTap = false; micFixUi();
+    if (why === 'mic') toast('The microphone stopped working, so practice was saved and ended. ' + who + ' Tap your name to pick up where you left off.', true);
+    else if (why === 'quiet') toast('No sound for ' + Math.round(QUIET_END_MS / 60000 * 10) / 10 + ' minutes, so practice was saved and ended. ' + who + ' Tap your name to pick up where you left off.', true);
     else toast('Saved! ' + who + ' Tap your name any time today to pick up where you left off.');
   }
   function earlyStop() {   // (unused since the End button saves and goes home)
@@ -1386,6 +1471,25 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   $('startBtn').onclick = begin;
   $('doneBtn').onclick = function () { finish('end'); };
   $('pauseBtn').onclick = togglePause;
+  $('micFix').onclick = micFixTap;
+  // ---------- Safe auto-reload (keeps a long-open window fresh). Only on the home screen, never during practice. ----------
+  // Today's time and unsent sessions are already in localStorage, so nothing is lost. Test overrides: ?reloadIdleMin= / ?reloadAgeMin=
+  var loadedAt = Date.now(), lastAct = Date.now(), reloading = false;
+  var RELOAD_IDLE_MS = (QS.reloadIdleMin && +QS.reloadIdleMin > 0 ? +QS.reloadIdleMin : 30) * 60000;     // idle on the home screen
+  var RELOAD_AGE_MS = (QS.reloadAgeMin && +QS.reloadAgeMin > 0 ? +QS.reloadAgeMin : 240) * 60000;       // page open this long (and idle 2 min)
+  ['touchstart', 'mousedown', 'keydown'].forEach(function (ev) { document.addEventListener(ev, function () { lastAct = Date.now(); }, true); });
+  function maybeReload() {
+    if (reloading || session || !$('pick').classList.contains('on') || $('panel').classList.contains('on')) return;
+    var idle = Date.now() - lastAct, age = Date.now() - loadedAt;
+    if (!(idle >= RELOAD_IDLE_MS || (age >= RELOAD_AGE_MS && idle >= Math.min(120000, RELOAD_IDLE_MS)))) return;
+    if (navigator.onLine === false || !window.fetch) return;
+    reloading = true;
+    // Only reload when the page can actually be fetched, so an offline iPad never lands on an error page.
+    fetch(location.pathname + '?alive=' + Date.now(), { cache: 'no-store' }).then(function (r) {
+      if (r.ok && !session && $('pick').classList.contains('on')) { store.set('reloadedAt', Date.now()); location.reload(); } else reloading = false;
+    }).catch(function () { reloading = false; });
+  }
+  setInterval(maybeReload, (QS.reloadIdleMin || QS.reloadAgeMin) ? 1000 : 60000);
   window.addEventListener('pagehide', function () { if (session) persist(); });
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden' && session) persist(); });
   // Midnight rollover: refresh the cards so "done today" resets.
@@ -1830,7 +1934,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   if (QS.kid) KIDS.forEach(function (k) { if (k.name.toLowerCase() === String(QS.kid).toLowerCase() && (!QS.instrument || k.instrument.toLowerCase() === String(QS.instrument).toLowerCase()) && !kid) openKid(k); });
   window.__wpt = { metro: metro, det: det, KIDS: KIDS, NOTES_ON: NOTES_ON, LOUD_COACH_ON: LOUD_COACH_ON,
     analyzeTone: typeof analyzeTone === 'function' ? analyzeTone : null,
-    logSession: logSession, getSession: function () { return session; }, doneToday: doneToday, dayOf: dayOf, QUIET_END_MS: QUIET_END_MS, finish: finish,
+    logSession: logSession, getSession: function () { return session; }, doneToday: doneToday, dayOf: dayOf, QUIET_END_MS: QUIET_END_MS, finish: finish, mic: mic,
     lessonsOf: lessonsOf, openKid: openKid, getLesson: function () { return lesson; }, checkServer: checkServer, store: store, getAudio: function () { return audio; } }; // for testing
 })();
 </script>
