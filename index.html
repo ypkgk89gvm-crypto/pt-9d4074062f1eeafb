@@ -203,6 +203,8 @@
   body.metro-open #practice .row { margin-top:16px; }
   .gear { z-index:25; width:56px; height:56px; padding:0; line-height:56px; text-align:center; font-size:28px; opacity:.75; background:rgba(255,255,255,.9); border-radius:50%; box-shadow:0 2px 8px rgba(42,34,72,.15); -webkit-transform:translateZ(0); transform:translateZ(0); touch-action:manipulation; }
   .btn.micfix { background:#FFF3C4; color:#6A4B00; border:3px solid #F5D76E; font-size:24px; padding:14px 26px; margin:4px 0 6px; animation:pulse 1.4s infinite; }
+  .btn.micfix.busy { animation:none; opacity:.8; }
+  .btn.micreload { font-size:19px; padding:10px 20px; margin:2px 0 6px; }
 </style>
 <script>
 // Feature test: flexbox gap (Safari 14.1+). If missing, <html class="no-flexgap"> turns on the margin fallback above.
@@ -255,6 +257,7 @@
   <div class="nudge notes-ui" id="nudge"></div>
   <div class="coach notes-ui" id="coach"></div>
   <button class="btn micfix" id="micFix" style="display:none">🎤 Tap to turn the mic back on</button>
+  <button class="btn alt micreload" id="micReload" style="display:none">🔄 Reload page (progress saved)</button>
   <div class="small" id="quietWarn" style="min-height:1.4em;font-weight:700;color:#B35A12"></div>
   <div class="row"><button class="btn pause" id="pauseBtn">⏸ Pause</button><button class="btn endb" id="doneBtn">■ End</button><button class="btn alt" id="metroToggle">🥁 Metronome</button></div>
   <div class="metro" id="metro" style="display:none" role="region" aria-label="Metronome">
@@ -1002,36 +1005,71 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   var savedFloor = store.get('floor', null); if (savedFloor) det.calibrate(savedFloor);
   var audio = null; // {ctx, stream, analyser, buf, sp}
   var onAudioBlock = null; // set during a coached session: (samples, startTime, sampleRate)
-  function startMic() {
-    if (audio) return Promise.resolve();
+  function startMic(opts) {
+    opts = opts || {};
+    if (audio && !opts.fresh) return Promise.resolve();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error(
       (STANDALONE || (IOSV !== null && location.protocol === 'https:')) ? 'Open this page in Safari to use the microphone.' : 'This page must be opened over https:// to use the microphone.'));
-    return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
-      .then(function (stream) {
-        var Ctx = window.AudioContext || window.webkitAudioContext; var ctx = new Ctx();
-        var src = ctx.createMediaStreamSource(stream);
-        var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 60;   // ignore rumble / thumps
-        var analyser = ctx.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.6; // a note shows up within a couple of ticks; one wild FFT does not flicker
-        analyser.minDecibels = -100;          // byte 0..255 matches analyzeTone's default map
-        analyser.maxDecibels = -30;
-        src.connect(hp); hp.connect(analyser);  // never connected to speakers, never recorded
-        // Small block tap for tempo (note-onset) detection. Its output goes through a muted gain: silent, nothing stored.
-        var sp = null;
-        try { sp = (ctx.createScriptProcessor || ctx.createJavaScriptNode).call(ctx, 1024, 1, 1); } catch (e) { sp = null; }
-        if (sp) {
-          var mute = ctx.createGain(); mute.gain.value = 0; hp.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
-          sp.onaudioprocess = function (ev) { if (onAudioBlock) { var b = ev.inputBuffer; try { onAudioBlock(b.getChannelData(0), ctx.currentTime - b.duration, b.sampleRate); } catch (e) {} } };
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    // Create and resume the AudioContext synchronously inside any user gesture before getUserMedia resolves.
+    var ctx = opts.ctx || (Ctx ? new Ctx() : null);
+    if (ctx && ctx.state !== 'running' && ctx.state !== 'closed' && ctx.resume) {
+      try { var r0 = ctx.resume(); if (r0 && r0.catch) r0.catch(function () {}); } catch (e) {}
+    }
+    var done = false, timer = null;
+    function closeCtx(c) { if (!c) return; try { var cl = c.close(); if (cl && cl.catch) cl.catch(function () {}); } catch (e) {} }
+    return new Promise(function (resolve, reject) {
+      function fail(err) {
+        if (done) return; done = true; clearTimeout(timer);
+        closeCtx(ctx); ctx = null;
+        reject(err);
+      }
+      if (opts.timeoutMs) timer = setTimeout(function () { var e = new Error('Mic request timed out'); e.timeout = true; fail(e); }, opts.timeoutMs);
+      var gum;
+      try { gum = navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }); }
+      catch (e) { fail(e); return; }
+      Promise.resolve(gum).then(function (stream) {
+        if (done || (opts.isStale && opts.isStale())) {
+          try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+          fail(new Error('Stale mic request'));
+          return;
         }
-        audio = { ctx: ctx, stream: stream, analyser: analyser, buf: new Float32Array(analyser.fftSize), sp: sp };
-        if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
-      });
+        done = true; clearTimeout(timer);
+        try {
+          if (!ctx && Ctx) ctx = new Ctx();
+          var src = ctx.createMediaStreamSource(stream);
+          var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 60;   // ignore rumble / thumps
+          var analyser = ctx.createAnalyser();
+          analyser.fftSize = 2048;
+          analyser.smoothingTimeConstant = 0.6; // a note shows up within a couple of ticks; one wild FFT does not flicker
+          analyser.minDecibels = -100;          // byte 0..255 matches analyzeTone's default map
+          analyser.maxDecibels = -30;
+          src.connect(hp); hp.connect(analyser);  // never connected to speakers, never recorded
+          // Small block tap for tempo (note-onset) detection. Its output goes through a muted gain: silent, nothing stored.
+          var sp = null, mute = null;
+          try { sp = (ctx.createScriptProcessor || ctx.createJavaScriptNode).call(ctx, 1024, 1, 1); } catch (e) { sp = null; }
+          if (sp) {
+            mute = ctx.createGain(); mute.gain.value = 0; hp.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
+            sp.onaudioprocess = function (ev) { if (onAudioBlock) { var b = ev.inputBuffer; try { onAudioBlock(b.getChannelData(0), ctx.currentTime - b.duration, b.sampleRate); } catch (e) {} } };
+          }
+          if (audio) teardownAudio();
+          audio = { ctx: ctx, stream: stream, src: src, hp: hp, analyser: analyser, buf: new Float32Array(analyser.fftSize), sp: sp, mute: mute };
+          if (ctx.state !== 'running' && ctx.state !== 'closed' && ctx.resume) {
+            try { var r1 = ctx.resume(); if (r1 && r1.catch) r1.catch(function () {}); } catch (e) {}
+          }
+          resolve();
+        } catch (err) {
+          try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+          closeCtx(ctx); ctx = null;
+          reject(err);
+        }
+      }, fail);
+    });
   }
-  // Older iOS only lets Web Audio start inside a tap. If the sound engine is still paused, the next tap anywhere wakes it.
+  // Older iOS only lets Web Audio start inside a tap. If the sound engine is still paused/interrupted, the next tap anywhere wakes it.
   function wakeAudio() {
     var cs = [audio && audio.ctx, metro && metro.ctx && metro.ctx()];
-    cs.forEach(function (c) { try { if (c && c.state === 'suspended' && c.resume) c.resume(); } catch (e) {} });
+    cs.forEach(function (c) { try { if (c && c.state !== 'running' && c.state !== 'closed' && c.resume) { var p = c.resume(); if (p && p.catch) p.catch(function () {}); } } catch (e) {} });
   }
   document.addEventListener('touchend', wakeAudio, true); document.addEventListener('click', wakeAudio, true);
   function stopMic() {
@@ -1043,8 +1081,12 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   function teardownAudio() {
     if (!audio) return; var a = audio; audio = null;
     if (a.sp) { a.sp.onaudioprocess = null; try { a.sp.disconnect(); } catch (e) {} }
+    try { if (a.mute) a.mute.disconnect(); } catch (e) {}
+    try { if (a.analyser) a.analyser.disconnect(); } catch (e) {}
+    try { if (a.hp) a.hp.disconnect(); } catch (e) {}
+    try { if (a.src) a.src.disconnect(); } catch (e) {}
     try { a.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-    try { a.ctx.close(); } catch (e) {}
+    try { var cl = a.ctx.close(); if (cl && cl.catch) cl.catch(function () {}); } catch (e) {}
   }
   // ---------- Metronome (Web Audio, lookahead-scheduled, shares the mic's AudioContext) ----------
   var metro = (function () {
@@ -1053,10 +1095,15 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     var beats = store.get('metroBeats', 4);
     var ctx = null, ownCtx = false, gain = null, running = false, timer = null, nextT = 0, beatN = 0, clicks = [];
     function getCtx() {
-      if (audio && audio.ctx && audio.ctx.state !== 'closed') { if (ctx !== audio.ctx) { ctx = audio.ctx; ownCtx = false; gain = null; } }
+      if (audio && audio.ctx && audio.ctx.state !== 'closed') {
+        if (ctx !== audio.ctx) {
+          if (ownCtx && ctx) { try { var cl = ctx.close(); if (cl && cl.catch) cl.catch(function () {}); } catch (e) {} }
+          ctx = audio.ctx; ownCtx = false; gain = null;
+        }
+      }
       else if (!ctx || ctx.state === 'closed') { var C = window.AudioContext || window.webkitAudioContext; ctx = new C(); ownCtx = true; gain = null; }
       if (!gain) { gain = ctx.createGain(); gain.gain.value = 0.35; gain.connect(ctx.destination); }  // moderate volume
-      if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+      if (ctx.state !== 'running' && ctx.state !== 'closed' && ctx.resume) { try { var p = ctx.resume(); if (p && p.catch) p.catch(function () {}); } catch (e) {} }
       return ctx;
     }
     function click(t, accent) {
@@ -1189,15 +1236,24 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   // Safari can suspend the sound engine, end or mute the mic track (screen lock, a call, Siri, another tab), or keep
   // handing back an all-zero signal. Silence auto-end only counts time while the mic is healthy.
   var MIC_STUCK_MS = 4000;      // the exact same level for this long = no live signal (a real mic always has a little noise)
+  var MIC_TIMEOUT_MS = 4000;    // abort a hung getUserMedia so "Reconnecting" can never wedge
+  var MIC_RESUME_MS = 1500;     // abort a hung ctx.resume() and fall back to rebuilding the mic
+  var MIC_VERIFY_MS = 2000;     // wait after rebuild for real varying audio before clearing tap/retry state
   var MIC_GIVEUP_MS = QUIET_END_MS + 60000;   // mic still broken after this long: save and end
-  var mic = { last: -1, sameSince: 0, mutedSince: 0, deadSince: 0, lastTry: 0, tries: 0, busy: false, needTap: false, recoveries: 0, why: '' };
-  function micReset() { mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.deadSince = 0; mic.lastTry = 0; mic.tries = 0; mic.needTap = false; mic.why = ''; micFixUi(); }
+  var mic = { last: -1, sameSince: 0, mutedSince: 0, deadSince: 0, lastTry: 0, tries: 0, busy: false, byTap: false, busyAt: 0, gen: 0, verifying: 0, verifyNonZero: 0, byTapLast: false, tapFails: 0, needTap: false, reloadOffer: false, recoveries: 0, why: '', hiddenAt: 0 };
+  function micReset() {
+    mic.gen++; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.deadSince = 0; mic.lastTry = 0;
+    mic.tries = 0; mic.busy = false; mic.byTap = false; mic.busyAt = 0; mic.verifying = 0; mic.verifyNonZero = 0;
+    mic.byTapLast = false; mic.tapFails = 0; mic.needTap = false; mic.reloadOffer = false; mic.why = ''; mic.hiddenAt = 0;
+    micFixUi();
+  }
   function micProblem(now, level) {
     if (document.visibilityState === 'hidden') return 'hidden';
     if (!audio) return 'none';
     var st = audio.ctx.state;
     if (st === 'closed') return 'closed';
-    if (st === 'suspended' || st === 'interrupted') return 'suspended';
+    if (st === 'interrupted') return 'interrupted';
+    if (st !== 'running') return 'suspended';
     var ts = audio.stream.getAudioTracks ? audio.stream.getAudioTracks() : audio.stream.getTracks(), tr = ts && ts[0];
     if (!tr || tr.readyState === 'ended') return 'ended';
     if (tr.muted) { if (!mic.mutedSince) mic.mutedSince = now; if (now - mic.mutedSince > 3000) return 'muted'; } else mic.mutedSince = 0;
@@ -1206,43 +1262,132 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if (mic.sameSince && now - mic.sameSince > MIC_STUCK_MS) return level === 0 ? 'zero' : 'flat';
     return '';
   }
-  function micFixUi() { var b = $('micFix'); if (b) b.style.display = (session && mic.needTap) ? '' : 'none'; }
-  // Re-create the mic stream + sound engine. Safe to call from a tap (Safari may insist on one).
-  function rebuildMic() {
-    if (mic.busy) return; mic.busy = true;
+  function micFixUi() {
+    var b = $('micFix'), r = $('micReload');
+    var showFix = !!(session && mic.needTap);
+    if (b) {
+      b.style.display = showFix ? '' : 'none';
+      b.classList.toggle('busy', !!(mic.busy || mic.verifying));
+      b.textContent = (mic.busy || mic.verifying) ? '⏳ Reconnecting the mic…' : '🎤 Tap to turn the mic back on';
+    }
+    if (r) r.style.display = (session && mic.reloadOffer && !mic.busy && !mic.verifying) ? '' : 'none';
+  }
+  function resumeCtxWithTimeout(ctx, ms) {
+    if (!ctx || ctx.state === 'closed' || !ctx.resume) return Promise.reject(new Error('no ctx'));
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; reject(new Error('resume timeout')); } }, ms || MIC_RESUME_MS);
+      try {
+        var pr = ctx.resume();
+        if (!pr || !pr.then) {
+          clearTimeout(t); done = true;
+          if (ctx.state === 'running') resolve(); else reject(new Error('not running'));
+          return;
+        }
+        pr.then(function () {
+          if (done) return; done = true; clearTimeout(t);
+          if (ctx.state === 'running') resolve(); else reject(new Error('not running'));
+        }, function (e) {
+          if (done) return; done = true; clearTimeout(t);
+          reject(e || new Error('resume failed'));
+        });
+      } catch (e) {
+        if (!done) { done = true; clearTimeout(t); reject(e); }
+      }
+    });
+  }
+  // Re-create the mic stream + sound engine. Safe to call directly inside a tap gesture.
+  function rebuildMic(fromTap) {
+    if (!session) return;
+    if (mic.busy) {
+      if (fromTap && !mic.byTap) { mic.gen++; mic.busy = false; }
+      else return;
+    }
+    var myGen = ++mic.gen;
+    mic.busy = true; mic.byTap = !!fromTap; mic.busyAt = Date.now();
+    mic.verifying = 0; mic.verifyNonZero = 0; mic.byTapLast = !!fromTap;
+    if (fromTap) mic.needTap = true;
+    micFixUi();
     var wasMetro = metro.isRunning(); if (wasMetro) metro.stop();
     teardownAudio();
-    startMic().then(function () {
-      mic.busy = false; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.recoveries++;
+    startMic({
+      fresh: true,
+      timeoutMs: MIC_TIMEOUT_MS,
+      isStale: function () { return !session || mic.gen !== myGen; }
+    }).then(function () {
+      if (!session || mic.gen !== myGen) { teardownAudio(); return; }
+      mic.busy = false; mic.byTap = false; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.recoveries++;
+      if (!audio || audio.ctx.state !== 'running') {
+        mic.byTapLast = false;
+        if (fromTap) { mic.tapFails++; mic.reloadOffer = true; }
+        mic.needTap = true; micFixUi();
+        return;
+      }
       if (wasMetro && session) metro.start();
-      if (audio && audio.ctx.state !== 'running') { mic.needTap = true; micFixUi(); }
-    }).catch(function () { mic.busy = false; mic.needTap = true; micFixUi(); });
+      // Hold off clearing needTap/tries until real varying audio arrives (defeats dead-but-live zero streams).
+      mic.verifying = performance.now() || 1; mic.verifyNonZero = 0;
+      micFixUi();
+    }).catch(function (err) {
+      if (mic.gen !== myGen) return;
+      mic.busy = false; mic.byTap = false; mic.verifying = 0; mic.byTapLast = false;
+      if (fromTap) { mic.tapFails++; mic.needTap = true; mic.reloadOffer = true; }
+      else if ((err && err.timeout) || mic.tries >= 3) { mic.needTap = true; }
+      micFixUi();
+    });
   }
   function healMic(why, now) {
-    if (why === 'hidden' || mic.busy) return;
+    if (why === 'hidden' || why === 'verifying' || mic.busy || mic.needTap) return;
     var wait = mic.tries < 3 ? 2500 : 10000;
-    if (now - mic.lastTry < wait) return;
+    if (mic.lastTry && now - mic.lastTry < wait) return;
     mic.lastTry = now; mic.tries++;
-    if (why === 'suspended' && mic.tries <= 2 && audio && audio.ctx.resume) {
-      try { var pr = audio.ctx.resume(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
-    } else rebuildMic();
+    if ((why === 'suspended' || why === 'interrupted') && mic.tries <= (why === 'interrupted' ? 1 : 2) && audio && audio.ctx.resume) {
+      var myGen = ++mic.gen;
+      mic.busy = true; mic.byTap = false; mic.busyAt = Date.now();
+      resumeCtxWithTimeout(audio.ctx, MIC_RESUME_MS).then(function () {
+        if (mic.gen !== myGen) return;
+        mic.busy = false; mic.last = -1; mic.sameSince = 0;
+        if (why === 'interrupted') { mic.verifying = performance.now() || 1; mic.verifyNonZero = 0; }
+      }).catch(function () {
+        if (mic.gen !== myGen) return;
+        mic.busy = false;
+        rebuildMic(false);
+      });
+    } else rebuildMic(false);
     if (mic.tries >= 3) { mic.needTap = true; micFixUi(); }   // older Safari may only allow the mic back after a tap
   }
   function micFixTap() {
     if (!session) return;
+    if (mic.busy && mic.byTap) return; // single in-flight lock guards double-tap during recovery
     mic.lastTry = performance.now();
-    if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && audio.ctx.resume) {
-      try { var pr = audio.ctx.resume(); if (pr && pr.then) pr.then(function () { if (audio.ctx.state !== 'running') rebuildMic(); }, function () { rebuildMic(); }); } catch (e) { rebuildMic(); }
-    } else rebuildMic();
+    // Inside the tap gesture: stop old tracks, close/replace AudioContext, resume it, and request a fresh stream.
+    rebuildMic(true);
+  }
+  function micReloadTap() {
+    if (session) persist();
+    stopMic();
+    location.reload();
   }
   // Coming back to the page (screen woke, tab switched back, window focused): wake the sound engine and re-check now.
   function micWake() {
     if (!session) return;
     keepAwake();
+    var sleptMs = mic.hiddenAt ? Date.now() - mic.hiddenAt : 0;
+    mic.hiddenAt = 0;
+    if (sleptMs > 5000) {
+      session.heardAt = performance.now();
+      if (mic.deadSince) mic.deadSince = performance.now();
+    }
+    if (mic.busy && Date.now() - mic.busyAt > MIC_TIMEOUT_MS + 1000) {
+      mic.gen++; mic.busy = false; mic.byTap = false; micFixUi();
+    }
     if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && audio.ctx.resume) { try { var pr = audio.ctx.resume(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {} }
-    mic.lastTry = 0; mic.sameSince = 0;
+    mic.lastTry = 0;
+    if (!mic.verifying) mic.sameSince = 0;
   }
-  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') micWake(); });
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') micWake();
+    else if (document.visibilityState === 'hidden') mic.hiddenAt = Date.now();
+  });
   window.addEventListener('pageshow', micWake); window.addEventListener('focus', micWake);
 
   function begin() {
@@ -1262,20 +1407,42 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     });
   }
   function step() {
-    var now = performance.now(), dt = Math.min(0.5, (now - session.last) / 1000); session.last = now;
+    var now = performance.now(), rawGap = now - session.last, dt = Math.min(0.5, rawGap / 1000); session.last = now;
+    if (rawGap > 5000) {
+      // Tab/device slept: don't immediately trip quiet-end or mic-giveup on the first wake tick.
+      session.heardAt = now;
+      if (mic.deadSince) mic.deadSince = now;
+    }
     var level = readLevel(), why = micProblem(now, level);
+    if (mic.verifying && !why) {
+      if (level > 0 && !mic.sameSince) mic.verifyNonZero++;
+      if (mic.verifyNonZero >= 2) {
+        mic.verifying = 0; mic.verifyNonZero = 0; mic.byTapLast = false;
+      } else if (now - mic.verifying >= MIC_VERIFY_MS) {
+        mic.verifying = 0; mic.verifyNonZero = 0;
+        mic.sameSince = now - MIC_STUCK_MS - 1;
+        why = level === 0 ? 'zero' : 'flat';
+        if (mic.byTapLast) { mic.byTapLast = false; mic.tapFails++; mic.needTap = true; mic.reloadOffer = true; }
+        micFixUi();
+      } else {
+        why = 'verifying';
+      }
+    }
     mic.why = why;
     if (why) {
       // Not real silence: hold the 3-minute quiet clock and fix the mic.
       session.heardAt = now; if (!mic.deadSince) mic.deadSince = now;
-      healMic(why, now);
+      if (why !== 'verifying') healMic(why, now);
       if (why !== 'hidden' && now - mic.deadSince > MIC_GIVEUP_MS) { finish('mic'); return; }
       det.reset();
       render(false); $('quietWarn').textContent = '';
       if (now - session.savedAt > 3000) persist(now);
       return;
     }
-    if (mic.deadSince) { mic.deadSince = 0; mic.tries = 0; mic.needTap = false; micFixUi(); }
+    if (mic.deadSince || mic.needTap || mic.tapFails || mic.reloadOffer) {
+      mic.deadSince = 0; mic.tries = 0; mic.tapFails = 0; mic.byTapLast = false;
+      mic.needTap = false; mic.reloadOffer = false; micFixUi();
+    }
     var r = det.update(level, now, metro.gated(audio ? audio.analyser.fftSize / audio.ctx.sampleRate : 0.05), readTone(session.kid && session.kid.instrument));
     if (!r.gated && r.level > r.threshold) session.heardAt = now;      // any sound above the room's quiet level
     var counting = r.playing && !session.paused;
@@ -1309,7 +1476,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   function togglePause() {
     if (!session) return;
     session.paused = !session.paused; setPauseUi(session.paused); persist();
-    if (!session.paused && audio && audio.ctx.state === 'suspended' && audio.ctx.resume) audio.ctx.resume();
+    if (!session.paused) { mic.lastTry = 0; if (!mic.verifying) mic.sameSince = 0; if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && audio.ctx.resume) { try { var rp = audio.ctx.resume(); if (rp && rp.catch) rp.catch(function () {}); } catch (e) {} } }
     render(false);
   }
   function toast(msg, warn) { var t = $('toast'); t.textContent = msg || ''; t.classList.toggle('on', !!msg); t.classList.toggle('warn', !!warn); }
@@ -1319,9 +1486,14 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     $('clock').style.color = playing ? 'var(--ink)' : '#B9AEF7';
     var st = $('status');
     if (session.paused) { st.className = 'status wait'; st.textContent = '⏸ Paused — tap Resume to keep going'; }
-    else if (mic.why && mic.why !== 'hidden') { st.className = 'status wait'; st.textContent = mic.needTap ? '🎤 The mic stopped — tap the yellow button' : '🎤 Reconnecting the mic…'; }
+    else if (mic.why && mic.why !== 'hidden') {
+      st.className = 'status wait';
+      st.textContent = (mic.needTap && !mic.busy && mic.why !== 'verifying')
+        ? (mic.reloadOffer ? '🎤 Mic still stopped — tap yellow button or reload' : '🎤 The mic stopped — tap the yellow button')
+        : '🎤 Reconnecting the mic…';
+    }
     else if (playing) { st.className = 'status go'; st.textContent = '🎵 Playing — keep it up!'; }
-    else if (audio && audio.ctx.state === 'suspended') { st.className = 'status wait'; st.textContent = '👆 Tap the screen, then start playing!'; }
+    else if (audio && (audio.ctx.state === 'suspended' || audio.ctx.state === 'interrupted')) { st.className = 'status wait'; st.textContent = '👆 Tap the screen, then start playing!'; }
     else { st.className = 'status wait'; st.textContent = total < 1 ? '🎶 Start playing!' : '🎶 Waiting for you to play…'; }
     $('prog').style.width = Math.min(100, total / target * 100) + '%';
   }
@@ -1339,7 +1511,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if (why === 'done') { toast(''); celebrate(); return; }
     renderKids(); show('pick');
     var who = s.kid.name + ' · ' + s.kid.instrument + ': ' + fmt(total) + ' of ' + fmt(target) + ' saved for today.';
-    mic.needTap = false; micFixUi();
+    mic.gen++; mic.busy = false; mic.byTap = false; mic.verifying = 0; mic.needTap = false; mic.reloadOffer = false; micFixUi();
     if (why === 'mic') toast('The microphone stopped working, so practice was saved and ended. ' + who + ' Tap your name to pick up where you left off.', true);
     else if (why === 'quiet') toast('No sound for ' + Math.round(QUIET_END_MS / 60000 * 10) / 10 + ' minutes, so practice was saved and ended. ' + who + ' Tap your name to pick up where you left off.', true);
     else toast('Saved! ' + who + ' Tap your name any time today to pick up where you left off.');
@@ -1472,6 +1644,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   $('doneBtn').onclick = function () { finish('end'); };
   $('pauseBtn').onclick = togglePause;
   $('micFix').onclick = micFixTap;
+  $('micReload').onclick = micReloadTap;
   // ---------- Safe auto-reload (keeps a long-open window fresh). Only on the home screen, never during practice. ----------
   // Today's time and unsent sessions are already in localStorage, so nothing is lost. Test overrides: ?reloadIdleMin= / ?reloadAgeMin=
   var loadedAt = Date.now(), lastAct = Date.now(), reloading = false;

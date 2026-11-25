@@ -17,7 +17,9 @@ async function open(wav, qs, w = 1024, h = 768) {
   return { b, p };
 }
 const st = p => p.evaluate(() => { const a = window.__wpt.getAudio(); return { screen: document.querySelector('.screen.on').id, clock: document.getElementById('clock').textContent, status: document.getElementById('status').textContent,
-  ctx: a ? a.ctx.state : null, rec: window.__wpt.mic.recoveries, why: window.__wpt.mic.why, fix: document.getElementById('micFix').style.display !== 'none' }; });
+  ctx: a ? a.ctx.state : null, rec: window.__wpt.mic.recoveries, why: window.__wpt.mic.why, busy: window.__wpt.mic.busy,
+  fix: document.getElementById('micFix').style.display !== 'none', fixTxt: document.getElementById('micFix').textContent,
+  reload: document.getElementById('micReload').style.display !== 'none' }; });
 (async () => {
   let { b, p } = await open('play.wav', '?v=1');
   await p.evaluate(() => localStorage.setItem('wpt.logUrl', JSON.stringify('http://localhost:8772/log')));
@@ -76,6 +78,103 @@ const st = p => p.evaluate(() => { const a = window.__wpt.getAudio(); return { s
   await p.tap('#pauseBtn'); await sleep(5000);
   ok('never reloads while paused', await p.evaluate(() => window.__marker === 2));
   ok('no page errors (C)', !p.errs.length, p.errs);
-  await b.close(); srv.close();
+  await b.close();
+
+  { // D: iOS 'interrupted' context + hung resume() timeout -> auto-rebuilds & keeps counting;
+  //    dead-but-live silent track across rebuild -> escalates to tap without looping;
+  //    double-tap during delayed recovery -> single getUserMedia call;
+  //    tap recovery restores counting; hung getUserMedia -> timeout unlocks UI + offers reload keeping progress
+  ({ b, p } = await open('play.wav', '?v=2'));
+  await p.evaluate(() => localStorage.setItem('wpt.logUrl', JSON.stringify('http://localhost:8772/log')));
+  await p.tap('.kid:nth-child(4)'); await p.tap('#startBtn'); await sleep(4500);
+  let d0 = await st(p);
+  ok('D0 Ellis running and counting', d0.screen === 'practice' && d0.ctx === 'running' && secs(d0.clock) < 1200, d0);
+
+  // D1: iOS 'interrupted' state where ctx.resume() hangs forever -> resume timeout triggers rebuild
+  await p.evaluate(() => {
+    const a = window.__wpt.getAudio();
+    window.__oldCtxClosed = false;
+    const origClose = a.ctx.close.bind(a.ctx);
+    a.ctx.close = () => { window.__oldCtxClosed = true; return origClose(); };
+    Object.defineProperty(a.ctx, 'state', { configurable: true, get: () => 'interrupted' });
+    a.ctx.resume = () => new Promise(() => {}); // hung resume
+  });
+  await sleep(600);
+  const sawInterrupted = await p.evaluate(() => window.__seen.includes('interrupted'));
+  await sleep(3200);
+  let d1a = await st(p); await sleep(2200); let d1b = await st(p);
+  const oldClosed = await p.evaluate(() => window.__oldCtxClosed);
+  ok('D1 interrupted + hung resume -> timed out, old ctx closed, rebuilt & counting',
+    sawInterrupted && oldClosed && d1a.rec >= 1 && d1a.ctx === 'running' && !d1a.why && secs(d1b.clock) < secs(d1a.clock),
+    [sawInterrupted, oldClosed, d1a, d1b.clock]);
+
+  // D2: dead-but-live silent stream (track live, ctx running, analyser returns 0s even on auto-rebuilds) -> escalates to tap (no infinite reset loop)
+  await p.evaluate(() => {
+    window.__silentMode = true;
+    const origGetFloat = AnalyserNode.prototype.getFloatTimeDomainData;
+    AnalyserNode.prototype.__origGetFloat = origGetFloat;
+    AnalyserNode.prototype.getFloatTimeDomainData = function (buf) {
+      if (window.__silentMode) { buf.fill(0); return; }
+      return origGetFloat.call(this, buf);
+    };
+  });
+  await sleep(16000); // 4s detect + 3 rebuilds with 2s verify/2.5s wait
+  let d2 = await st(p);
+  ok('D2 dead-but-live silent track -> escalates to yellow button instead of looping',
+    d2.fix && !d2.busy && /Tap to turn the mic back on/.test(d2.fixTxt) && /tap the yellow button/i.test(d2.status), d2);
+
+  // D3: double-tap during delayed getUserMedia -> single in-flight lock (only 1 getUserMedia call), tap recovery restores counting
+  await p.evaluate(() => {
+    window.__silentMode = false;
+    window.__gumCalls = 0;
+    navigator.mediaDevices.getUserMedia = (c) => {
+      window.__gumCalls++;
+      return new Promise((res, rej) => setTimeout(() => window.__realGUM(c).then(res, rej), 900));
+    };
+  });
+  await p.tap('#micFix'); await sleep(120); await p.tap('#micFix');
+  let d3mid = await st(p);
+  await sleep(2200);
+  let d3a = await st(p); await sleep(2500); let d3b = await st(p);
+  const gumCalls = await p.evaluate(() => window.__gumCalls);
+  ok('D3 double-tap during recovery -> 1 getUserMedia call, tap restores counting',
+    gumCalls === 1 && d3mid.busy && !d3a.fix && !d3a.busy && !d3a.why && d3a.ctx === 'running' && secs(d3b.clock) < secs(d3a.clock),
+    { gumCalls, d3mid, d3a, clockAfter: d3b.clock });
+
+  // D4: hung getUserMedia on tap -> timeout clears Reconnecting, restores tap button + shows reload fallback keeping progress
+  await p.evaluate(() => {
+    navigator.mediaDevices.getUserMedia = () => new Promise(() => {}); // hung forever
+    window.__wpt.getAudio().stream.getTracks()[0].stop();
+  });
+  await sleep(7500); // auto-retry hits 4s timeout -> sets needTap
+  let d4a = await st(p);
+  ok('D4a hung background getUserMedia -> timed out cleanly to tap prompt', d4a.fix && !d4a.busy && !d4a.reload, d4a);
+  await p.tap('#micFix');
+  await sleep(500);
+  let d4mid = await st(p);
+  await sleep(4500); // tap recovery hits 4s timeout
+  let d4b = await st(p);
+  ok('D4b hung tap getUserMedia -> timeout clears busy, restores button & shows reload fallback',
+    d4mid.busy && d4b.fix && !d4b.busy && d4b.reload && /Tap to turn the mic back on/.test(d4b.fixTxt), [d4mid, d4b]);
+
+  // Reload fallback keeps today's progress via resume-today
+  const savedBeforeReload = await p.evaluate(() => {
+    const s = window.__wpt.getSession();
+    return Math.floor(s.base + s.played);
+  });
+  await Promise.all([p.waitForNavigation({ waitUntil: 'networkidle2' }), p.tap('#micReload')]);
+  const afterReload = await p.evaluate(() => ({
+    screen: document.querySelector('.screen.on').id,
+    ellisDone: Math.floor(window.__wpt.doneToday(window.__wpt.KIDS[3]))
+  }));
+  ok('D4c reload fallback keeps today progress',
+    afterReload.screen === 'pick' && savedBeforeReload >= 5 && afterReload.ellisDone >= savedBeforeReload - 1,
+    { savedBeforeReload, afterReload });
+  ok('no page errors (D)', !p.errs.length, p.errs);
+  await b.close();
+  }
+
+  srv.close();
   console.log(R.join('\n'));
+  if (R.some(l => l.startsWith('FAIL'))) process.exit(1);
 })().catch(e => { console.error(e); process.exit(1); });
