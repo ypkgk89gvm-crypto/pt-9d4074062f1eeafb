@@ -174,7 +174,46 @@ const st = p => p.evaluate(() => { const a = window.__wpt.getAudio(); return { s
   await b.close();
   }
 
+  { // E: "looks normal but hears nothing" (Nov 27 report)
+  ({ b, p } = await open('play.wav', '?hintSec=6'));
+  await p.evaluate(() => localStorage.setItem('wpt.logUrl', JSON.stringify('http://localhost:8772/log')));
+  await p.tap('.kid:nth-child(4)'); await p.tap('#startBtn'); await sleep(4000);
+  const ex = () => p.evaluate(() => ({ hint: document.getElementById('micHint').style.display !== 'none', floor: window.__wpt.det.floor(), hints: window.__wpt.mic.hints }));
+  let e0 = await st(p); ok('E0 counting normally, no hint', e0.ctx === 'running' && secs(e0.clock) < 1200 && !(await ex()).hint, e0);
+  // E1: noise floor can't climb above playing level (old code: a raised floor made the bar unreachable)
+  await p.evaluate(() => window.__wpt.det.calibrate(0.5)); const f1 = (await ex()).floor;
+  let e1a = await st(p); await sleep(3000); let e1b = await st(p);
+  ok('E1 raised noise estimate is capped, playing still counts', f1 <= 0.012 && secs(e1b.clock) < secs(e1a.clock), { f1, a: e1a.clock, b: e1b.clock });
+  // E2: iOS auto-gain flattens loudness: steady level but changing notes is music, not a fan
+  const e2 = await p.evaluate(() => { const d = createDetector({}); let r; d.update(0.001, 0); for (let i = 1; i <= 80; i++) r = d.update(0.1, i * 100, false, { tonal: true, f0: (Math.floor(i / 8) % 2) ? 660 : 440, score: 1 });
+    const h = createDetector({}); let q; h.update(0.001, 0); for (let i = 1; i <= 80; i++) q = h.update(0.1, i * 100, false, { tonal: true, f0: 120, score: 1 });
+    return { music: r.playing, hum: q.playing, humFloor: q.floor }; });
+  ok('E2 flat-loudness music still counts; one-pitch hum still rejected (floor capped)', e2.music && !e2.hum && e2.humFloor <= 0.012, e2);
+  // E3: alive but near-silent stream (tiny jitter, never exactly the same) -> "faint" -> rebuilt, then tap prompt (not a silent "normal" screen)
+  const r3 = (await st(p)).rec;
+  await p.evaluate(() => { const o = AnalyserNode.prototype.getFloatTimeDomainData; AnalyserNode.prototype.__o = o; window.__mode = 'faint';
+    AnalyserNode.prototype.getFloatTimeDomainData = function (buf) { if (window.__mode === 'faint') { for (let i = 0; i < buf.length; i++) buf[i] = (Math.random() - 0.5) * 2e-5; return; }
+      if (window.__mode === 'room') { for (let i = 0; i < buf.length; i++) buf[i] = (Math.random() - 0.5) * 1.4e-3; return; } return o.call(this, buf); }; });
+  await sleep(10000); let e3a = await st(p); const sawFaint = await p.evaluate(() => window.__seen.includes('faint'));
+  await sleep(12000); let e3b = await st(p);
+  ok('E3 faint-but-live stream detected and rebuilt, then yellow button', sawFaint && e3a.rec > r3 && e3b.fix && /yellow/.test(e3b.status), { sawFaint, e3a, e3b });
+  await p.evaluate(() => { window.__mode = ''; }); await p.tap('#micFix'); await sleep(3500); let e3c = await st(p); await sleep(2000); let e3d = await st(p);
+  ok('E3 tap restores counting', !e3c.fix && !e3c.why && secs(e3d.clock) < secs(e3c.clock), [e3c, e3d.clock]);
+  // E4: stream looks healthy (room-level noise, varying) but the playing never reaches it -> hint after hintSec, no mic warning
+  await p.evaluate(() => { window.__mode = 'room'; }); await sleep(11000); /* ~2.5 s playing hold + 6 s hint delay */ let e4a = await st(p); const x4a = await ex();
+  ok('E4 hears nothing while screen looks normal -> "Can\'t hear you? Tap here" shown', x4a.hint && !e4a.fix && !e4a.why && !e4a.reload && /play/i.test(e4a.status), [e4a, x4a]);
+  const r4 = e4a.rec; await p.evaluate(() => window.__wpt.det.calibrate(0.01));
+  await p.tap('#micHint'); await sleep(3000); let e4b = await st(p); const x4b = await ex();
+  ok('E4 hint tap -> full mic rebuild, floor reset, hint hidden', e4b.rec === r4 + 1 && !x4b.hint && x4b.floor <= 0.002 + 1e-9 && x4b.hints === 1, [e4b, x4b]);
+  await sleep(6500); let e4c = await st(p); const x4c = await ex();
+  ok('E4 still nothing after hint rebuild -> reload (progress kept) offered', x4c.hint && e4c.reload, [e4c, x4c]);
+  await p.evaluate(() => { window.__mode = ''; }); await sleep(4000); let e4d = await st(p); const x4d = await ex(); await sleep(2000); let e4e = await st(p);
+  ok('E4 sound back -> counting, hint + reload hidden', !x4d.hint && !e4d.reload && secs(e4e.clock) < secs(e4d.clock), [e4d, x4d, e4e.clock]);
+  ok('no page errors (E)', !p.errs.length, p.errs);
+  await b.close();
+  }
+
   srv.close();
   console.log(R.join('\n'));
   if (R.some(l => l.startsWith('FAIL'))) process.exit(1);
-})().catch(e => { console.error(e); process.exit(1); });
+})().catch(e => { console.log(R.join("\n")); console.error(e); process.exit(1); });

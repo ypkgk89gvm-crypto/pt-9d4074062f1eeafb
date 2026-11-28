@@ -205,6 +205,7 @@
   .btn.micfix { background:#FFF3C4; color:#6A4B00; border:3px solid #F5D76E; font-size:24px; padding:14px 26px; margin:4px 0 6px; animation:pulse 1.4s infinite; }
   .btn.micfix.busy { animation:none; opacity:.8; }
   .btn.micreload { font-size:19px; padding:10px 20px; margin:2px 0 6px; }
+  .btn.michint { font-size:18px; padding:8px 18px; margin:2px 0 6px; opacity:.85; }
 </style>
 <script>
 // Feature test: flexbox gap (Safari 14.1+). If missing, <html class="no-flexgap"> turns on the margin fallback above.
@@ -257,6 +258,7 @@
   <div class="nudge notes-ui" id="nudge"></div>
   <div class="coach notes-ui" id="coach"></div>
   <button class="btn micfix" id="micFix" style="display:none">🎤 Tap to turn the mic back on</button>
+  <button class="btn alt michint" id="micHint" style="display:none">👂 Can't hear you? Tap here</button>
   <button class="btn alt micreload" id="micReload" style="display:none">🔄 Reload page (progress saved)</button>
   <div class="small" id="quietWarn" style="min-height:1.4em;font-weight:700;color:#B35A12"></div>
   <div class="row"><button class="btn pause" id="pauseBtn">⏸ Pause</button><button class="btn endb" id="doneBtn">■ End</button><button class="btn alt" id="metroToggle">🥁 Metronome</button></div>
@@ -560,10 +562,12 @@ function createDetector(opts) {
     startFrames: 3,     // need this many musical frames out of the last 5 to (re)start
     absMin: 0.004,      // never count anything quieter than this (at sensitivity 5)
     steadyCv: 0.05,     // a sound this steady for steadyMs is a fan/dishwasher, not music
-    steadyMs: 4000
+    steadyMs: 4000,
+    maxFloor: 0.012     // the room-noise estimate can never climb above this (keeps the bar under real playing)
   }, opts || {});
   var floor = null, playing = false, lastSoundAt = -1e9, recent = [], hist = [];
   var lastF0 = 0, pendingF0 = 0, silence = 0;
+  function capF() { if (floor !== null && floor > o.maxFloor) floor = o.maxFloor; }
   function threshold() {
     var mult = 1.4 + (10 - o.sensitivity) * 0.5;      // 1.4x .. 5.9x the room noise
     var minAbs = o.absMin * (11 - o.sensitivity) / 6;
@@ -597,17 +601,21 @@ function createDetector(opts) {
       return { playing: playing, loud: false, gated: true, level: 0, floor: floor, threshold: threshold() };
     }
     if (floor === null) floor = level;
-    hist.push({ t: nowMs, v: level });
+    hist.push({ t: nowMs, v: level, f: (tone && tone.tonal && tone.f0 > 0) ? tone.f0 : 0 });
     while (hist.length && nowMs - hist[0].t > o.steadyMs) hist.shift();
     var volLoud = level > threshold();
     if (level < floor) floor = floor * 0.7 + level * 0.3;          // quieter room: adapt fast
     else if (!volLoud) floor = floor * 0.99 + level * 0.01;        // background creeping up: adapt slowly
+    capF();
     // Steady-noise guard: music rises and falls; an appliance hum does not.
     // A pure hum can look tonal, so this still rejects a few seconds of fan/fridge.
     if (volLoud && hist.length > 10 && nowMs - hist[0].t >= o.steadyMs * 0.9) {
       var m = 0; hist.forEach(function (h) { m += h.v; }); m /= hist.length;
       var s = 0; hist.forEach(function (h) { s += (h.v - m) * (h.v - m); }); s = Math.sqrt(s / hist.length);
-      if (m > 0 && s / m < o.steadyCv) { floor = m; volLoud = false; }
+      // A hum keeps one pitch; music changes notes. iOS auto-gain can flatten playing loudness, so only call it
+      // steady noise when no second, different pitch showed up in the window.
+      var f0s = [], notes = 0; hist.forEach(function (h) { if (h.f && !f0s.some(function (x) { return samePitch(x, h.f); })) f0s.push(h.f); }); notes = f0s.length;
+      if (m > 0 && s / m < o.steadyCv && notes < 2) { floor = Math.min(m, o.maxFloor); volLoud = false; }
     }
     if (!volLoud) {
       silence++;
@@ -624,7 +632,9 @@ function createDetector(opts) {
     update: update,
     set: function (k, v) { o[k] = v; },
     get: function (k) { return o[k]; },
-    calibrate: function (quietLevel) { floor = quietLevel; },
+    calibrate: function (quietLevel) { floor = quietLevel; capF(); },
+    floor: function () { return floor; },
+    capFloor: function (v) { if (floor !== null && v > 0 && floor > v) floor = v; },
     reset: function () { playing = false; recent = []; hist = []; lastSoundAt = -1e9; lastF0 = 0; pendingF0 = 0; silence = 0; }
   };
 }
@@ -1239,12 +1249,17 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   var MIC_TIMEOUT_MS = 4000;    // abort a hung getUserMedia so "Reconnecting" can never wedge
   var MIC_RESUME_MS = 1500;     // abort a hung ctx.resume() and fall back to rebuilding the mic
   var MIC_VERIFY_MS = 2000;     // wait after rebuild for real varying audio before clearing tap/retry state
+  var MIC_FAINT = 3e-5;         // below about -90 dB: no real iPad mic is this quiet, so the stream is alive but carries no sound
+  var MIC_FAINT_MS = 8000;      // that faint for this long = treat like a dead mic and rebuild it
+  var HINT_MS = (QS.hintSec && +QS.hintSec > 0 ? +QS.hintSec : 25) * 1000;   // not counting this long: offer "Can't hear you? Tap here"
+  function baseFloor() { var f = store.get('floor', null); return f > 0 ? f : 0.002; }   // the grown-up's calibration, else a quiet room
   var MIC_GIVEUP_MS = QUIET_END_MS + 60000;   // mic still broken after this long: save and end
-  var mic = { last: -1, sameSince: 0, mutedSince: 0, deadSince: 0, lastTry: 0, tries: 0, busy: false, byTap: false, busyAt: 0, gen: 0, verifying: 0, verifyNonZero: 0, byTapLast: false, tapFails: 0, needTap: false, reloadOffer: false, recoveries: 0, why: '', hiddenAt: 0 };
+  var mic = { last: -1, sameSince: 0, mutedSince: 0, deadSince: 0, lastTry: 0, tries: 0, busy: false, byTap: false, busyAt: 0, gen: 0, verifying: 0, verifyNonZero: 0, byTapLast: false, tapFails: 0, needTap: false, reloadOffer: false, recoveries: 0, why: '', hiddenAt: 0, faintSince: 0, hintAt: 0, hintReload: false, hints: 0 };
   function micReset() {
     mic.gen++; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.deadSince = 0; mic.lastTry = 0;
     mic.tries = 0; mic.busy = false; mic.byTap = false; mic.busyAt = 0; mic.verifying = 0; mic.verifyNonZero = 0;
     mic.byTapLast = false; mic.tapFails = 0; mic.needTap = false; mic.reloadOffer = false; mic.why = ''; mic.hiddenAt = 0;
+    mic.faintSince = 0; mic.hintAt = 0; mic.hintReload = false;
     micFixUi();
   }
   function micProblem(now, level) {
@@ -1260,6 +1275,8 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if (level === mic.last) { if (!mic.sameSince) mic.sameSince = now; } else mic.sameSince = 0;
     mic.last = level;
     if (mic.sameSince && now - mic.sameSince > MIC_STUCK_MS) return level === 0 ? 'zero' : 'flat';
+    // Alive but carrying (almost) nothing: tiny jitter dodges the exact-same check above.
+    if (level < MIC_FAINT) { if (!mic.faintSince) mic.faintSince = now; if (now - mic.faintSince > MIC_FAINT_MS) return 'faint'; } else mic.faintSince = 0;
     return '';
   }
   function micFixUi() {
@@ -1270,7 +1287,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
       b.classList.toggle('busy', !!(mic.busy || mic.verifying));
       b.textContent = (mic.busy || mic.verifying) ? '⏳ Reconnecting the mic…' : '🎤 Tap to turn the mic back on';
     }
-    if (r) r.style.display = (session && mic.reloadOffer && !mic.busy && !mic.verifying) ? '' : 'none';
+    if (r) r.style.display = (session && (mic.reloadOffer || mic.hintReload) && !mic.busy && !mic.verifying) ? '' : 'none';
   }
   function resumeCtxWithTimeout(ctx, ms) {
     if (!ctx || ctx.state === 'closed' || !ctx.resume) return Promise.reject(new Error('no ctx'));
@@ -1316,7 +1333,8 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
       isStale: function () { return !session || mic.gen !== myGen; }
     }).then(function () {
       if (!session || mic.gen !== myGen) { teardownAudio(); return; }
-      mic.busy = false; mic.byTap = false; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.recoveries++;
+      mic.busy = false; mic.byTap = false; mic.last = -1; mic.sameSince = 0; mic.mutedSince = 0; mic.faintSince = 0; mic.recoveries++;
+      det.reset(); det.capFloor(baseFloor());   // new stream, new levels: don't carry a raised noise estimate over
       if (!audio || audio.ctx.state !== 'running') {
         mic.byTapLast = false;
         if (fromTap) { mic.tapFails++; mic.reloadOffer = true; }
@@ -1362,6 +1380,21 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     // Inside the tap gesture: stop old tracks, close/replace AudioContext, resume it, and request a fresh stream.
     rebuildMic(true);
   }
+  // Looks fine but hears nothing (iOS can hand over a live stream that never carries the playing): after a while
+  // without counting, offer a small "Can't hear you?" button. Tapping it rebuilds the mic inside the tap; if it
+  // still doesn't count afterwards, the reload button (progress kept) shows too.
+  function hintUi(now) {
+    var h = $('micHint'); if (!h) return;
+    var on = !!(session && !session.paused && !mic.why && !mic.needTap && !mic.busy && now - session.countedAt >= HINT_MS);
+    if (on && mic.hintAt && !mic.hintReload) { mic.hintReload = true; micFixUi(); }   // already rebuilt once from the hint and still nothing
+    h.style.display = on ? '' : 'none';
+  }
+  function micHintTap() {
+    if (!session || (mic.busy && mic.byTap)) return;
+    mic.hints++; mic.hintAt = performance.now(); session.countedAt = mic.hintAt;
+    $('micHint').style.display = 'none';
+    rebuildMic(true);
+  }
   function micReloadTap() {
     if (session) persist();
     stopMic();
@@ -1374,6 +1407,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     var sleptMs = mic.hiddenAt ? Date.now() - mic.hiddenAt : 0;
     mic.hiddenAt = 0;
     if (sleptMs > 5000) {
+      det.capFloor(baseFloor());
       session.heardAt = performance.now();
       if (mic.deadSince) mic.deadSince = performance.now();
     }
@@ -1410,18 +1444,18 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     var now = performance.now(), rawGap = now - session.last, dt = Math.min(0.5, rawGap / 1000); session.last = now;
     if (rawGap > 5000) {
       // Tab/device slept: don't immediately trip quiet-end or mic-giveup on the first wake tick.
-      session.heardAt = now;
+      session.heardAt = now; session.countedAt = now;
       if (mic.deadSince) mic.deadSince = now;
     }
     var level = readLevel(), why = micProblem(now, level);
     if (mic.verifying && !why) {
-      if (level > 0 && !mic.sameSince) mic.verifyNonZero++;
+      if (level > MIC_FAINT && !mic.sameSince) mic.verifyNonZero++;
       if (mic.verifyNonZero >= 2) {
         mic.verifying = 0; mic.verifyNonZero = 0; mic.byTapLast = false;
       } else if (now - mic.verifying >= MIC_VERIFY_MS) {
         mic.verifying = 0; mic.verifyNonZero = 0;
-        mic.sameSince = now - MIC_STUCK_MS - 1;
-        why = level === 0 ? 'zero' : 'flat';
+        mic.sameSince = now - MIC_STUCK_MS - 1; if (level < MIC_FAINT) mic.faintSince = now - MIC_FAINT_MS - 1;   // stay "broken": no healthy-looking gap that resets the retry count
+        why = level === 0 ? 'zero' : (level < MIC_FAINT ? 'faint' : 'flat');
         if (mic.byTapLast) { mic.byTapLast = false; mic.tapFails++; mic.needTap = true; mic.reloadOffer = true; }
         micFixUi();
       } else {
@@ -1434,7 +1468,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
       session.heardAt = now; if (!mic.deadSince) mic.deadSince = now;
       if (why !== 'verifying') healMic(why, now);
       if (why !== 'hidden' && now - mic.deadSince > MIC_GIVEUP_MS) { finish('mic'); return; }
-      det.reset();
+      det.reset(); session.countedAt = now; hintUi(now);
       render(false); $('quietWarn').textContent = '';
       if (now - session.savedAt > 3000) persist(now);
       return;
@@ -1447,6 +1481,8 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
     if (!r.gated && r.level > r.threshold) session.heardAt = now;      // any sound above the room's quiet level
     var counting = r.playing && !session.paused;
     if (counting) session.played += dt;
+    if (counting || session.paused || !session.countedAt) { session.countedAt = now; if (counting && (mic.hintReload || mic.hintAt)) { mic.hintReload = false; mic.hintAt = 0; micFixUi(); } }
+    hintUi(now);
     coachStep(r, now, dt);
     meter($('lvl'), $('thr'), r); if ($('panel').classList.contains('on')) meter($('lvl2'), $('thr2'), r);
     render(counting);
@@ -1645,6 +1681,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   $('pauseBtn').onclick = togglePause;
   $('micFix').onclick = micFixTap;
   $('micReload').onclick = micReloadTap;
+  $('micHint').onclick = micHintTap;
   // ---------- Safe auto-reload (keeps a long-open window fresh). Only on the home screen, never during practice. ----------
   // Today's time and unsent sessions are already in localStorage, so nothing is lost. Test overrides: ?reloadIdleMin= / ?reloadAgeMin=
   var loadedAt = Date.now(), lastAct = Date.now(), reloading = false;
@@ -2107,7 +2144,7 @@ if (typeof module !== 'undefined') module.exports = { parseLessonNotes: parseLes
   if (QS.kid) KIDS.forEach(function (k) { if (k.name.toLowerCase() === String(QS.kid).toLowerCase() && (!QS.instrument || k.instrument.toLowerCase() === String(QS.instrument).toLowerCase()) && !kid) openKid(k); });
   window.__wpt = { metro: metro, det: det, KIDS: KIDS, NOTES_ON: NOTES_ON, LOUD_COACH_ON: LOUD_COACH_ON,
     analyzeTone: typeof analyzeTone === 'function' ? analyzeTone : null,
-    logSession: logSession, getSession: function () { return session; }, doneToday: doneToday, dayOf: dayOf, QUIET_END_MS: QUIET_END_MS, finish: finish, mic: mic,
+    logSession: logSession, getSession: function () { return session; }, doneToday: doneToday, dayOf: dayOf, QUIET_END_MS: QUIET_END_MS, finish: finish, mic: mic, HINT_MS: HINT_MS, readLevel: readLevel,
     lessonsOf: lessonsOf, openKid: openKid, getLesson: function () { return lesson; }, checkServer: checkServer, store: store, getAudio: function () { return audio; } }; // for testing
 })();
 </script>
